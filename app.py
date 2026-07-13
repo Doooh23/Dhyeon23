@@ -1752,7 +1752,8 @@ train_window = st.sidebar.slider(
 model_mode = st.sidebar.selectbox(
     "모델 방식",
     ["LSTM", "ARIMA", "Transformer", "3모델 앙상블"],
-    index=0,
+    index=1,
+    help="배포 서버에서는 ARIMA가 가장 빠릅니다. LSTM과 Transformer는 실행 버튼을 누른 뒤 학습합니다.",
 )
 
 default_epochs = 5 if analysis_mode == "빠른 실전 모드" else 12
@@ -2042,8 +2043,40 @@ def render_asset_tab(asset_type, is_coin, default_list, default_input):
         st.warning("종목을 입력해 주세요.")
         return
 
-    with st.spinner(f"{model_mode} 모델 학습 및 검증 중..."):
-        result = analyze_symbol(symbol, interval, data_range)
+    # 페이지를 열자마자 무거운 모델 학습을 시작하지 않는다.
+    # 빠른 예측은 최신 신호만 계산하고, 정밀 백테스트는 사용자가 명시적으로 실행한다.
+    result_key = f"analysis_result_{asset_type}"
+    signature_key = f"analysis_signature_{asset_type}"
+    current_signature = (symbol, interval, data_range, model_mode, lookback_window, forecast_horizon, train_window, model_epochs, pred_step, retrain_every)
+
+    run_col1, run_col2 = st.columns(2)
+    with run_col1:
+        run_quick = st.button(
+            "빠른 예측 실행",
+            use_container_width=True,
+            key=f"run_quick_{asset_type}",
+            help="최신 예측만 계산합니다. 배포 서버에서 먼저 이 기능을 사용하세요.",
+        )
+    with run_col2:
+        run_full = st.button(
+            "정밀 백테스트 실행",
+            use_container_width=True,
+            key=f"run_full_{asset_type}",
+            help="과거 구간을 반복 학습하므로 LSTM과 Transformer는 오래 걸릴 수 있습니다.",
+        )
+
+    if run_quick or run_full:
+        mode_text = "최신 예측" if run_quick else "정밀 백테스트"
+        with st.spinner(f"{model_mode} {mode_text} 실행 중..."):
+            result = analyze_symbol(symbol, interval, data_range, scanner_fast=run_quick)
+        st.session_state[result_key] = result
+        st.session_state[signature_key] = current_signature
+
+    if st.session_state.get(signature_key) != current_signature or result_key not in st.session_state:
+        st.info("종목과 모델을 선택한 뒤 '빠른 예측 실행'을 누르세요. 정밀 백테스트는 필요할 때만 실행하는 것이 안정적입니다.")
+        return
+
+    result = st.session_state[result_key]
     df, name, market, pred_df, latest, trades, equity_df, buys, sells, metrics, acc, acc_n, active = result
     if df is None:
         st.error("데이터가 부족하거나 불러오지 못했습니다. 일봉처럼 더 긴 기간이 있는 차트를 선택해 주세요.")
