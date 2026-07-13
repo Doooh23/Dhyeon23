@@ -1,5 +1,5 @@
 """
-시계열 데이터를 활용한 주식·코인 매수 타점 예측 프로그램
+LSTM·ARIMA·Transformer 시계열 모델을 활용한 주식·코인 매수 타점 예측 프로그램
 """
 
 import json
@@ -15,14 +15,28 @@ import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import gc
+import warnings
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 try:
-    from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
-    from sklearn.linear_model import Ridge, LogisticRegression
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-    SKLEARN_AVAILABLE = True
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
+    TF_AVAILABLE = True
 except Exception:
-    SKLEARN_AVAILABLE = False
+    tf = None
+    keras = None
+    layers = None
+    TF_AVAILABLE = False
+
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+    STATSMODELS_AVAILABLE = True
+except Exception:
+    ARIMA = None
+    STATSMODELS_AVAILABLE = False
 
 # ==========================================================
 # 기본 설정
@@ -417,7 +431,7 @@ def get_market_regime(symbol, interval, data_range):
     }
 
 # ==========================================================
-# 시계열 특징 / 모델
+# 시계열 특징 / LSTM · ARIMA · Transformer
 # ==========================================================
 
 @dataclass
@@ -425,6 +439,7 @@ class CostConfig:
     fee_pct: float
     slippage_pct: float
     sell_tax_pct: float
+
 
 @dataclass
 class RiskConfig:
@@ -479,145 +494,270 @@ def risk_score_at(df, idx):
     return float(np.clip(risk, 0, 1))
 
 
-def compute_feature_at(df, idx, lookback, market_score=0.5):
-    if idx < max(lookback, 200):
-        return None
-    window = df.iloc[idx - lookback + 1: idx + 1]
-    close = float(df.loc[idx, "close"])
-    returns = window["close"].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
-    feats = []
+def make_sequence_feature_frame(df, market_score=0.5):
+    """신경망에 넣을 봉별 특징을 만든다. 절대가격 대신 비율·수익률 중심으로 구성한다."""
+    close = df["close"].replace(0, np.nan)
+    prev_close = close.shift(1)
+    log_close = np.log(close)
+    log_volume = np.log1p(df["volume"].clip(lower=0))
 
-    # 최근 수익률과 모멘텀
-    for w in [1, 2, 3, 5, 10, 20, 60, 120]:
-        if idx - w >= 0 and df.loc[idx - w, "close"] != 0:
-            feats.append(close / df.loc[idx - w, "close"] - 1)
+    feat = pd.DataFrame(index=df.index)
+    feat["log_return"] = log_close.diff()
+    feat["open_gap"] = df["open"] / prev_close - 1
+    feat["high_from_close"] = df["high"] / close - 1
+    feat["low_from_close"] = df["low"] / close - 1
+    feat["candle_body"] = df["close"] / df["open"].replace(0, np.nan) - 1
+    feat["range_pct"] = (df["high"] - df["low"]) / close
+    feat["volume_change"] = log_volume.diff()
+
+    vol_mean = log_volume.rolling(20).mean()
+    vol_std = log_volume.rolling(20).std().replace(0, np.nan)
+    feat["volume_z20"] = (log_volume - vol_mean) / vol_std
+
+    for w in [5, 20, 60, 120]:
+        ma_col = f"ma{w}"
+        if ma_col in df:
+            feat[f"ma{w}_gap"] = close / df[ma_col].replace(0, np.nan) - 1
         else:
-            feats.append(0.0)
+            feat[f"ma{w}_gap"] = 0.0
 
-    # 변동성, 왜도 비슷한 방향성 정보
-    for w in [5, 10, 20, min(lookback, 60), min(lookback, 120)]:
-        s = returns.tail(w)
-        feats.append(nan_to_zero(s.std()))
-        feats.append(nan_to_zero(s.mean()))
+    feat["rsi_norm"] = (df.get("rsi", pd.Series(50, index=df.index)) - 50) / 50
+    feat["atr_pct"] = df.get("atr_pct", pd.Series(0, index=df.index))
+    feat["vol_ratio"] = df.get("volRatio", pd.Series(1, index=df.index)) - 1
+    feat["volatility20"] = df.get("volatility20", pd.Series(0, index=df.index))
+    feat["market_score"] = float(market_score) - 0.5
 
-    # 이동평균선 위치와 기울기
-    for w in [5, 10, 20, 60, 120, 200]:
-        ma = df.loc[idx, f"ma{w}"]
-        feats.append(close / ma - 1 if pd.notna(ma) and ma != 0 else 0.0)
-        past = df.loc[max(0, idx - min(w, 20)), f"ma{w}"]
-        feats.append(ma / past - 1 if pd.notna(ma) and pd.notna(past) and past != 0 else 0.0)
-
-    # RSI, 거래량, ATR
-    feats.append((nan_to_zero(df.loc[idx, "rsi"]) - 50) / 50)
-    feats.append(nan_to_zero(df.loc[idx, "volRatio"]) - 1)
-    vol_short = window["volume"].tail(5).mean()
-    vol_long = window["volume"].tail(min(lookback, 60)).mean()
-    feats.append(vol_short / vol_long - 1 if vol_long > 0 else 0.0)
-    feats.append(nan_to_zero(df.loc[idx, "atr_pct"]))
-    feats.append(nan_to_zero(df.loc[idx, "candle_body"]))
-    feats.append(nan_to_zero(df.loc[idx, "range_pct"]))
-
-    # 박스권 위치
-    box_h = window["high"].max()
-    box_l = window["low"].min()
-    if box_h > box_l:
-        feats.append((close - box_l) / (box_h - box_l))
-        feats.append((box_h - box_l) / close)
-    else:
-        feats.extend([0.5, 0.0])
-
-    # 리스크/시장 필터 정보
-    feats.append(risk_score_at(df, idx))
-    feats.append(float(market_score))
-
-    arr = np.array(feats, dtype=float)
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    feat = feat.replace([np.inf, -np.inf], np.nan)
+    feat = feat.ffill().fillna(0.0)
+    feat = feat.clip(lower=-8.0, upper=8.0)
+    return feat.astype(np.float32)
 
 
 def build_dataset(df, lookback, horizon, market_score=0.5):
+    """
+    X: (표본 수, 시퀀스 길이, 특징 수)
+    y: 현재 종가 대비 horizon봉 뒤 수익률
+    """
+    features = make_sequence_feature_frame(df, market_score)
     X, idxs, y = [], [], []
-    start = max(lookback, 200)
+    start = max(int(lookback) - 1, 200)
+
     for idx in range(start, len(df)):
-        feat = compute_feature_at(df, idx, lookback, market_score)
-        if feat is None:
+        window = features.iloc[idx - lookback + 1: idx + 1].to_numpy(dtype=np.float32)
+        if len(window) != lookback:
             continue
+        X.append(window)
         idxs.append(idx)
-        X.append(feat)
         if idx + horizon < len(df):
-            y.append(df.loc[idx + horizon, "close"] / df.loc[idx, "close"] - 1)
+            future_return = df.loc[idx + horizon, "close"] / df.loc[idx, "close"] - 1
+            y.append(float(future_return))
         else:
             y.append(np.nan)
+
     if not X:
         return None, None, None
-    return np.vstack(X), np.array(idxs), np.array(y, dtype=float)
+    return np.stack(X).astype(np.float32), np.asarray(idxs, dtype=int), np.asarray(y, dtype=float)
 
 
-def fit_predict_ensemble(X_train, y_train, x_one, model_mode="앙상블"):
-    mask = np.isfinite(y_train)
-    X_train = X_train[mask]
-    y_train = y_train[mask]
+def selected_model_names(model_mode):
+    if model_mode == "3모델 앙상블":
+        return ["LSTM", "ARIMA", "Transformer"]
+    return [model_mode]
+
+
+def validate_model_dependencies(model_mode):
+    names = selected_model_names(model_mode)
+    missing = []
+    if any(name in names for name in ["LSTM", "Transformer"]) and not TF_AVAILABLE:
+        missing.append("tensorflow-cpu")
+    if "ARIMA" in names and not STATSMODELS_AVAILABLE:
+        missing.append("statsmodels")
+    return missing
+
+
+def _build_lstm_model(sequence_length, feature_count, learning_rate):
+    inputs = keras.Input(shape=(sequence_length, feature_count))
+    x = layers.LSTM(40, return_sequences=True)(inputs)
+    x = layers.LayerNormalization()(x)
+    x = layers.Dropout(0.10)(x)
+    x = layers.LSTM(20)(x)
+    x = layers.Dense(20, activation="gelu")(x)
+    x = layers.Dropout(0.10)(x)
+    outputs = layers.Dense(1)(x)
+    model = keras.Model(inputs, outputs, name="lstm_return_regressor")
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0),
+        loss=keras.losses.Huber(delta=1.0),
+    )
+    return model
+
+
+def _build_transformer_model(sequence_length, feature_count, learning_rate):
+    d_model = 32
+    inputs = keras.Input(shape=(sequence_length, feature_count))
+    x = layers.Dense(d_model)(inputs)
+
+    positions = tf.range(start=0, limit=sequence_length, delta=1)
+    positional_embedding = layers.Embedding(
+        input_dim=sequence_length,
+        output_dim=d_model,
+        name="positional_embedding",
+    )(positions)
+    x = x + positional_embedding
+
+    attention = layers.MultiHeadAttention(
+        num_heads=4,
+        key_dim=d_model // 4,
+        dropout=0.10,
+    )(x, x)
+    x = layers.LayerNormalization(epsilon=1e-6)(x + attention)
+
+    feed_forward = layers.Dense(64, activation="gelu")(x)
+    feed_forward = layers.Dropout(0.10)(feed_forward)
+    feed_forward = layers.Dense(d_model)(feed_forward)
+    x = layers.LayerNormalization(epsilon=1e-6)(x + feed_forward)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(24, activation="gelu")(x)
+    x = layers.Dropout(0.10)(x)
+    outputs = layers.Dense(1)(x)
+
+    model = keras.Model(inputs, outputs, name="transformer_return_regressor")
+    model.compile(
+        optimizer=keras.optimizers.AdamW(
+            learning_rate=learning_rate,
+            weight_decay=1e-4,
+            clipnorm=1.0,
+        ),
+        loss=keras.losses.Huber(delta=1.0),
+    )
+    return model
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def deep_predict_cached(
+    model_name,
+    X_train,
+    y_train,
+    X_predict,
+    epochs,
+    batch_size,
+    learning_rate,
+    seed=42,
+):
+    """LSTM 또는 Transformer를 학습하고 여러 시점의 수익률을 한 번에 예측한다."""
+    if not TF_AVAILABLE:
+        raise RuntimeError("TensorFlow가 설치되지 않았습니다.")
+
+    X_train = np.asarray(X_train, dtype=np.float32)
+    y_train = np.asarray(y_train, dtype=np.float32)
+    X_predict = np.asarray(X_predict, dtype=np.float32)
+
+    valid = np.isfinite(y_train)
+    X_train = X_train[valid]
+    y_train = y_train[valid]
     if len(y_train) < 60:
-        return 0.0, 0.5, 0.02
+        return np.zeros(len(X_predict), dtype=float)
 
-    scale = float(np.nanstd(y_train))
-    if not np.isfinite(scale) or scale < 1e-5:
-        scale = 0.02
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(int(seed))
 
-    if SKLEARN_AVAILABLE:
-        preds = []
-        probs = []
-        if model_mode in ["앙상블", "Ridge"]:
-            ridge = make_pipeline(StandardScaler(), Ridge(alpha=2.0))
-            ridge.fit(X_train, y_train)
-            p = float(ridge.predict(x_one.reshape(1, -1))[0])
-            preds.append(p)
-            probs.append(float(sigmoid(p / scale)))
-        if model_mode in ["앙상블", "GradientBoosting"]:
-            gb = GradientBoostingRegressor(
-                n_estimators=80, learning_rate=0.04, max_depth=2,
-                subsample=0.8, random_state=42
-            )
-            gb.fit(X_train, y_train)
-            p = float(gb.predict(x_one.reshape(1, -1))[0])
-            preds.append(p)
-            probs.append(float(sigmoid(p / scale)))
-        if model_mode in ["앙상블", "RandomForest"]:
-            y_cls = (y_train > 0).astype(int)
-            if len(np.unique(y_cls)) >= 2:
-                rf = RandomForestClassifier(
-                    n_estimators=120, max_depth=4, min_samples_leaf=8,
-                    random_state=42, class_weight="balanced_subsample"
-                )
-                rf.fit(X_train, y_cls)
-                probs.append(float(rf.predict_proba(x_one.reshape(1, -1))[0][1]))
-        if model_mode in ["앙상블", "Logistic"]:
-            y_cls = (y_train > 0).astype(int)
-            if len(np.unique(y_cls)) >= 2:
-                logi = make_pipeline(StandardScaler(), LogisticRegression(max_iter=500, class_weight="balanced"))
-                logi.fit(X_train, y_cls)
-                probs.append(float(logi.predict_proba(x_one.reshape(1, -1))[0][1]))
-        pred = float(np.mean(preds)) if preds else 0.0
-        prob = float(np.mean(probs)) if probs else float(sigmoid(pred / scale))
-        return pred, prob, scale
+    feature_mean = X_train.mean(axis=(0, 1), keepdims=True)
+    feature_std = X_train.std(axis=(0, 1), keepdims=True)
+    feature_std[feature_std < 1e-6] = 1.0
 
-    # fallback: 직접 구현한 Ridge
-    mean = X_train.mean(axis=0)
-    std = X_train.std(axis=0)
-    std[std == 0] = 1.0
-    Xs = (X_train - mean) / std
-    xo = (x_one - mean) / std
-    X_aug = np.column_stack([np.ones(len(Xs)), Xs])
-    xo_aug = np.concatenate([[1.0], xo])
-    alpha = 2.0
-    reg = np.eye(X_aug.shape[1]) * alpha
-    reg[0, 0] = 0.0
+    Xs = np.nan_to_num((X_train - feature_mean) / feature_std).astype(np.float32)
+    Xp = np.nan_to_num((X_predict - feature_mean) / feature_std).astype(np.float32)
+
+    y_mean = float(np.mean(y_train))
+    y_std = float(np.std(y_train))
+    if not np.isfinite(y_std) or y_std < 1e-5:
+        y_std = 0.02
+    ys = ((y_train - y_mean) / y_std).astype(np.float32)
+
+    if model_name == "LSTM":
+        model = _build_lstm_model(Xs.shape[1], Xs.shape[2], float(learning_rate))
+    elif model_name == "Transformer":
+        model = _build_transformer_model(Xs.shape[1], Xs.shape[2], float(learning_rate))
+    else:
+        raise ValueError(f"지원하지 않는 딥러닝 모델: {model_name}")
+
+    validation_split = 0.15 if len(ys) >= 100 else 0.10
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=3,
+            min_delta=1e-4,
+            restore_best_weights=True,
+        ),
+        keras.callbacks.TerminateOnNaN(),
+    ]
+
+    model.fit(
+        Xs,
+        ys,
+        epochs=int(epochs),
+        batch_size=min(int(batch_size), len(ys)),
+        validation_split=validation_split,
+        shuffle=False,
+        verbose=0,
+        callbacks=callbacks,
+    )
+    pred_scaled = model.predict(Xp, verbose=0).reshape(-1)
+    predictions = pred_scaled * y_std + y_mean
+    predictions = np.clip(predictions, -0.80, 0.80).astype(float)
+
+    tf.keras.backend.clear_session()
+    del model
+    gc.collect()
+    return predictions
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def arima_forecast_cached(close_values, horizon, order=(2, 0, 1), max_history=700):
+    """종가 로그수익률에 ARIMA를 적합하고 horizon봉 누적 수익률을 반환한다."""
+    if not STATSMODELS_AVAILABLE:
+        raise RuntimeError("statsmodels가 설치되지 않았습니다.")
+
+    close_values = np.asarray(close_values, dtype=float)
+    close_values = close_values[np.isfinite(close_values) & (close_values > 0)]
+    if len(close_values) < 80:
+        return 0.0
+
+    close_values = close_values[-int(max_history):]
+    log_returns = np.diff(np.log(close_values))
+    log_returns = log_returns[np.isfinite(log_returns)]
+    if len(log_returns) < 60:
+        return 0.0
+
     try:
-        beta = np.linalg.solve(X_aug.T @ X_aug + reg, X_aug.T @ y_train)
-    except np.linalg.LinAlgError:
-        beta = np.linalg.pinv(X_aug.T @ X_aug + reg) @ X_aug.T @ y_train
-    pred = float(xo_aug @ beta)
-    return pred, float(sigmoid(pred / scale)), scale
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fitted = ARIMA(
+                log_returns,
+                order=tuple(order),
+                trend="c",
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit()
+            future_log_returns = np.asarray(
+                fitted.forecast(steps=int(horizon)),
+                dtype=float,
+            )
+        future_log_returns = np.clip(future_log_returns, -0.25, 0.25)
+        return float(np.exp(np.sum(future_log_returns)) - 1)
+    except Exception:
+        # 수렴 실패 시 최근 평균 로그수익률을 제한적으로 사용한다.
+        drift = float(np.nanmean(log_returns[-30:]))
+        drift = float(np.clip(drift, -0.03, 0.03))
+        return float(np.exp(drift * int(horizon)) - 1)
 
+
+def prediction_scale(y_train):
+    scale = float(np.nanstd(np.asarray(y_train, dtype=float)))
+    if not np.isfinite(scale) or scale < 0.005:
+        scale = 0.02
+    return scale
 
 
 def clamp01(v):
@@ -738,89 +878,356 @@ def signal_grade(prob, expected_net, risk, market_ok, final_score=0.5):
     return "관망", "조건 부족"
 
 
-def walk_forward_predictions(
-    df, lookback, horizon, train_window, model_mode, risk_strength, cost_cfg,
-    market_score=0.5, step=1, weights=None, ml_weight=0.65
+def _prediction_row(
+    df,
+    idx,
+    actual_future_return,
+    pred_raw,
+    scale,
+    risk_strength,
+    round_trip_cost,
+    market_score,
+    weights,
+    ml_weight,
 ):
+    risk = risk_score_at(df, idx)
+    pred_adj = float(pred_raw - risk_strength * risk * scale)
+    prob_raw = float(sigmoid(pred_raw / max(scale, 1e-6)))
+    prob_adj = float(
+        np.clip(
+            prob_raw * 0.65 + sigmoid(pred_adj / max(scale, 1e-6)) * 0.35,
+            0,
+            1,
+        )
+    )
+    expected_net = pred_adj - round_trip_cost
+    tech_score, comps = weighted_technical_score_at(df, idx, weights, market_score)
+    ml_score = float(
+        np.clip(
+            prob_adj * 0.60
+            + sigmoid(expected_net / max(scale, 1e-6)) * 0.40,
+            0,
+            1,
+        )
+    )
+    final_score = float(
+        np.clip(
+            ml_score * ml_weight + tech_score * (1 - ml_weight),
+            0,
+            1,
+        )
+    )
+    return {
+        "idx": int(idx),
+        "date": df.loc[idx, "date"],
+        "pred_return_raw": float(pred_raw),
+        "pred_return": pred_adj,
+        "expected_net": float(expected_net),
+        "prob_up": prob_adj,
+        "risk_score": float(risk),
+        "tech_score": tech_score,
+        "ml_score": ml_score,
+        "final_score": final_score,
+        "scale": float(scale),
+        "actual_future_return": (
+            float(actual_future_return)
+            if np.isfinite(actual_future_return)
+            else np.nan
+        ),
+        **{f"comp_{k}": v for k, v in comps.items()},
+    }
+
+
+def _known_training_positions(idxs, y, prediction_pos, horizon):
+    """해당 예측 시점에 실제로 결과가 확정된 과거 라벨만 선택한다."""
+    current_idx = int(idxs[prediction_pos])
+    candidates = np.arange(prediction_pos)
+    if len(candidates) == 0:
+        return candidates
+    known = (
+        np.isfinite(y[candidates])
+        & ((idxs[candidates] + int(horizon)) <= current_idx)
+    )
+    return candidates[known]
+
+
+def walk_forward_predictions(
+    df,
+    lookback,
+    horizon,
+    train_window,
+    model_mode,
+    risk_strength,
+    cost_cfg,
+    market_score=0.5,
+    step=1,
+    weights=None,
+    ml_weight=0.65,
+    model_epochs=8,
+    batch_size=32,
+    learning_rate=0.001,
+    retrain_every=8,
+    arima_order=(2, 0, 1),
+):
+    """
+    주기적 walk-forward 검증.
+    딥러닝 모델은 retrain_every개의 검증 지점마다 재학습해 서버 부하를 제한한다.
+    """
     X, idxs, y = build_dataset(df, lookback, horizon, market_score)
     if X is None:
         return pd.DataFrame()
-    weights = weights or {"trend": 1, "momentum": 1, "rsi": 1, "volume": 1, "volatility": 1, "pullback": 1, "market": 1, "risk_inverse": 1}
+
+    weights = weights or {
+        "trend": 1,
+        "momentum": 1,
+        "rsi": 1,
+        "volume": 1,
+        "volatility": 1,
+        "pullback": 1,
+        "market": 1,
+        "risk_inverse": 1,
+    }
+    missing = validate_model_dependencies(model_mode)
+    if missing:
+        raise RuntimeError("필수 패키지 누락: " + ", ".join(missing))
+
+    min_train_samples = 60
+    eval_positions = list(
+        range(min_train_samples, len(idxs), max(1, int(step)))
+    )
+    if not eval_positions:
+        return pd.DataFrame()
+
     rows = []
-    round_trip_cost = cost_cfg.fee_pct * 2 + cost_cfg.slippage_pct * 2 + cost_cfg.sell_tax_pct
-    for row_i in range(0, len(idxs), step):
-        idx = int(idxs[row_i])
-        train_end = row_i
-        train_start = max(0, train_end - train_window)
-        X_train = X[train_start:train_end]
-        y_train = y[train_start:train_end]
-        pred_raw, prob_raw, scale = fit_predict_ensemble(X_train, y_train, X[row_i], model_mode)
-        risk = risk_score_at(df, idx)
-        pred_adj = pred_raw - risk_strength * risk * scale
-        prob_adj = float(np.clip((prob_raw * 0.65) + (sigmoid(pred_adj / scale) * 0.35), 0, 1))
-        expected_net = pred_adj - round_trip_cost
-        tech_score, comps = weighted_technical_score_at(df, idx, weights, market_score)
-        ml_score = float(np.clip((prob_adj * 0.60) + (sigmoid(expected_net / max(scale, 1e-6)) * 0.40), 0, 1))
-        final_score = float(np.clip(ml_score * ml_weight + tech_score * (1 - ml_weight), 0, 1))
-        rows.append({
-            "idx": idx,
-            "date": df.loc[idx, "date"],
-            "pred_return_raw": pred_raw,
-            "pred_return": pred_adj,
-            "expected_net": expected_net,
-            "prob_up": prob_adj,
-            "risk_score": risk,
-            "tech_score": tech_score,
-            "ml_score": ml_score,
-            "final_score": final_score,
-            "scale": scale,
-            "actual_future_return": y[row_i] if np.isfinite(y[row_i]) else np.nan,
-            **{f"comp_{k}": v for k, v in comps.items()},
-        })
+    round_trip_cost = (
+        cost_cfg.fee_pct * 2
+        + cost_cfg.slippage_pct * 2
+        + cost_cfg.sell_tax_pct
+    )
+    names = selected_model_names(model_mode)
+    chunk_size = max(1, int(retrain_every))
+
+    for chunk_start in range(0, len(eval_positions), chunk_size):
+        chunk_positions = eval_positions[chunk_start: chunk_start + chunk_size]
+        anchor_pos = chunk_positions[0]
+        train_positions = _known_training_positions(
+            idxs, y, anchor_pos, horizon
+        )
+        if len(train_positions) < min_train_samples:
+            continue
+        train_positions = train_positions[-int(train_window):]
+
+        X_train = X[train_positions]
+        y_train = y[train_positions]
+        X_predict = X[chunk_positions]
+        scale = prediction_scale(y_train)
+
+        model_prediction_vectors = []
+
+        if "LSTM" in names:
+            model_prediction_vectors.append(
+                deep_predict_cached(
+                    "LSTM",
+                    X_train,
+                    y_train,
+                    X_predict,
+                    int(model_epochs),
+                    int(batch_size),
+                    float(learning_rate),
+                    42 + chunk_start,
+                )
+            )
+
+        if "Transformer" in names:
+            model_prediction_vectors.append(
+                deep_predict_cached(
+                    "Transformer",
+                    X_train,
+                    y_train,
+                    X_predict,
+                    int(model_epochs),
+                    int(batch_size),
+                    float(learning_rate),
+                    142 + chunk_start,
+                )
+            )
+
+        if "ARIMA" in names:
+            arima_vector = []
+            for pos in chunk_positions:
+                idx = int(idxs[pos])
+                close_history = df.loc[:idx, "close"].to_numpy(dtype=float)
+                arima_vector.append(
+                    arima_forecast_cached(
+                        close_history,
+                        int(horizon),
+                        tuple(arima_order),
+                        max(300, int(train_window) + int(lookback)),
+                    )
+                )
+            model_prediction_vectors.append(np.asarray(arima_vector, dtype=float))
+
+        if not model_prediction_vectors:
+            continue
+
+        combined_predictions = np.mean(
+            np.vstack(model_prediction_vectors),
+            axis=0,
+        )
+
+        for local_i, pos in enumerate(chunk_positions):
+            idx = int(idxs[pos])
+            rows.append(
+                _prediction_row(
+                    df=df,
+                    idx=idx,
+                    actual_future_return=y[pos],
+                    pred_raw=float(combined_predictions[local_i]),
+                    scale=scale,
+                    risk_strength=risk_strength,
+                    round_trip_cost=round_trip_cost,
+                    market_score=market_score,
+                    weights=weights,
+                    ml_weight=ml_weight,
+                )
+            )
+
     return pd.DataFrame(rows)
 
 
 def latest_prediction(
-    df, lookback, horizon, train_window, model_mode, risk_strength, cost_cfg,
-    market_score=0.5, market_ok=True, weights=None, ml_weight=0.65
+    df,
+    lookback,
+    horizon,
+    train_window,
+    model_mode,
+    risk_strength,
+    cost_cfg,
+    market_score=0.5,
+    market_ok=True,
+    weights=None,
+    ml_weight=0.65,
+    model_epochs=8,
+    batch_size=32,
+    learning_rate=0.001,
+    arima_order=(2, 0, 1),
 ):
     X, idxs, y = build_dataset(df, lookback, horizon, market_score)
     if X is None or len(X) < 70:
         return None
-    weights = weights or {"trend": 1, "momentum": 1, "rsi": 1, "volume": 1, "volatility": 1, "pullback": 1, "market": 1, "risk_inverse": 1}
-    latest_idx = len(df) - 1
-    x = compute_feature_at(df, latest_idx, lookback, market_score)
-    if x is None:
-        return None
-    valid = np.isfinite(y)
-    X_train = X[valid][-train_window:]
-    y_train = y[valid][-train_window:]
-    pred_raw, prob_raw, scale = fit_predict_ensemble(X_train, y_train, x, model_mode)
-    risk = risk_score_at(df, latest_idx)
-    round_trip_cost = cost_cfg.fee_pct * 2 + cost_cfg.slippage_pct * 2 + cost_cfg.sell_tax_pct
-    pred_adj = pred_raw - risk_strength * risk * scale
-    prob_adj = float(np.clip((prob_raw * 0.65) + (sigmoid(pred_adj / scale) * 0.35), 0, 1))
-    expected_net = pred_adj - round_trip_cost
-    tech_score, comps = weighted_technical_score_at(df, latest_idx, weights, market_score)
-    ml_score = float(np.clip((prob_adj * 0.60) + (sigmoid(expected_net / max(scale, 1e-6)) * 0.40), 0, 1))
-    final_score = float(np.clip(ml_score * ml_weight + tech_score * (1 - ml_weight), 0, 1))
-    grade, reason = signal_grade(prob_adj, expected_net, risk, market_ok, final_score)
-    return {
-        "idx": latest_idx,
-        "date": df.loc[latest_idx, "date"],
-        "pred_return_raw": pred_raw,
-        "pred_return": pred_adj,
-        "expected_net": expected_net,
-        "prob_up": prob_adj,
-        "risk_score": risk,
-        "tech_score": tech_score,
-        "ml_score": ml_score,
-        "final_score": final_score,
-        "scale": scale,
-        "grade": grade,
-        "reason": reason,
-        "components": comps,
+
+    weights = weights or {
+        "trend": 1,
+        "momentum": 1,
+        "rsi": 1,
+        "volume": 1,
+        "volatility": 1,
+        "pullback": 1,
+        "market": 1,
+        "risk_inverse": 1,
     }
+    missing = validate_model_dependencies(model_mode)
+    if missing:
+        raise RuntimeError("필수 패키지 누락: " + ", ".join(missing))
+
+    latest_pos = len(idxs) - 1
+    latest_idx = int(idxs[latest_pos])
+    train_positions = _known_training_positions(
+        idxs, y, latest_pos, horizon
+    )
+    if len(train_positions) < 60:
+        return None
+    train_positions = train_positions[-int(train_window):]
+
+    X_train = X[train_positions]
+    y_train = y[train_positions]
+    X_predict = X[latest_pos: latest_pos + 1]
+    names = selected_model_names(model_mode)
+    predictions = []
+
+    if "LSTM" in names:
+        predictions.append(
+            float(
+                deep_predict_cached(
+                    "LSTM",
+                    X_train,
+                    y_train,
+                    X_predict,
+                    int(model_epochs),
+                    int(batch_size),
+                    float(learning_rate),
+                    2026,
+                )[0]
+            )
+        )
+
+    if "Transformer" in names:
+        predictions.append(
+            float(
+                deep_predict_cached(
+                    "Transformer",
+                    X_train,
+                    y_train,
+                    X_predict,
+                    int(model_epochs),
+                    int(batch_size),
+                    float(learning_rate),
+                    2027,
+                )[0]
+            )
+        )
+
+    if "ARIMA" in names:
+        predictions.append(
+            float(
+                arima_forecast_cached(
+                    df.loc[:latest_idx, "close"].to_numpy(dtype=float),
+                    int(horizon),
+                    tuple(arima_order),
+                    max(300, int(train_window) + int(lookback)),
+                )
+            )
+        )
+
+    if not predictions:
+        return None
+
+    pred_raw = float(np.mean(predictions))
+    scale = prediction_scale(y_train)
+    round_trip_cost = (
+        cost_cfg.fee_pct * 2
+        + cost_cfg.slippage_pct * 2
+        + cost_cfg.sell_tax_pct
+    )
+    row = _prediction_row(
+        df=df,
+        idx=latest_idx,
+        actual_future_return=np.nan,
+        pred_raw=pred_raw,
+        scale=scale,
+        risk_strength=risk_strength,
+        round_trip_cost=round_trip_cost,
+        market_score=market_score,
+        weights=weights,
+        ml_weight=ml_weight,
+    )
+    grade, reason = signal_grade(
+        row["prob_up"],
+        row["expected_net"],
+        row["risk_score"],
+        market_ok,
+        row["final_score"],
+    )
+    row["grade"] = grade
+    row["reason"] = reason
+    row["model"] = model_mode
+    row["components"] = {
+        key.replace("comp_", ""): value
+        for key, value in row.items()
+        if key.startswith("comp_")
+    }
+    return row
+
 
 # ==========================================================
 # 백테스트 / 성능 지표
@@ -1318,18 +1725,87 @@ show_range_slider = st.sidebar.checkbox("하단 기간 조절 바", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"<h3 style='color:{C['text']}'>🧠 예측 모델</h3>", unsafe_allow_html=True)
-analysis_mode = st.sidebar.radio("분석 속도", ["빠른 실전 모드", "정밀 검증 모드"], index=0, horizontal=True)
-lookback_window = st.sidebar.selectbox("입력 시계열 길이", [20, 60, 120], index=1)
-forecast_horizon = st.sidebar.selectbox("예측 기간", [3, 5, 10, 20], index=1)
-train_window = st.sidebar.slider("Walk-forward 학습 표본 수", 120, 900, 320, 10)
-model_default = 3 if analysis_mode == "빠른 실전 모드" else 0
-model_mode = st.sidebar.selectbox("모델 방식", ["앙상블", "GradientBoosting", "RandomForest", "Ridge", "Logistic"], index=model_default)
-pred_step = st.sidebar.slider("백테스트 계산 간격", 1, 20, 8 if analysis_mode == "빠른 실전 모드" else 3, 1, help="숫자가 클수록 빠르지만 검증 표본이 줄어듭니다.")
+analysis_mode = st.sidebar.radio(
+    "분석 속도",
+    ["빠른 실전 모드", "정밀 검증 모드"],
+    index=0,
+    horizontal=True,
+)
+lookback_window = st.sidebar.selectbox(
+    "입력 시계열 길이",
+    [20, 40, 60, 120],
+    index=2,
+    help="LSTM과 Transformer가 한 번에 보는 과거 봉 수입니다.",
+)
+forecast_horizon = st.sidebar.selectbox(
+    "예측 기간",
+    [3, 5, 10, 20],
+    index=1,
+)
+train_window = st.sidebar.slider(
+    "학습 표본 수",
+    120,
+    900,
+    320,
+    10,
+)
+model_mode = st.sidebar.selectbox(
+    "모델 방식",
+    ["LSTM", "ARIMA", "Transformer", "3모델 앙상블"],
+    index=0,
+)
+
+default_epochs = 5 if analysis_mode == "빠른 실전 모드" else 12
+default_step = 20 if analysis_mode == "빠른 실전 모드" else 5
+default_retrain = 20 if analysis_mode == "빠른 실전 모드" else 5
+
+with st.sidebar.expander("신경망 학습 설정", expanded=False):
+    model_epochs = st.slider(
+        "학습 Epoch",
+        3,
+        30,
+        default_epochs,
+        1,
+        help="높을수록 오래 학습하지만 실행 시간이 크게 증가합니다.",
+    )
+    deep_batch_size = st.selectbox(
+        "배치 크기",
+        [16, 32, 64],
+        index=1,
+    )
+    deep_learning_rate = st.selectbox(
+        "학습률",
+        [0.0003, 0.0005, 0.001, 0.002],
+        index=2,
+        format_func=lambda x: f"{x:.4f}",
+    )
+
+pred_step = st.sidebar.slider(
+    "백테스트 계산 간격",
+    1,
+    30,
+    default_step,
+    1,
+    help="예측을 계산할 봉 간격입니다. 높이면 빨라지지만 검증 표본이 줄어듭니다.",
+)
+retrain_every = st.sidebar.slider(
+    "신경망 재학습 간격",
+    1,
+    30,
+    default_retrain,
+    1,
+    help="Walk-forward 검증 지점 몇 개마다 LSTM/Transformer를 다시 학습할지 정합니다.",
+)
+arima_order = (2, 0, 1)
+
 min_prob = st.sidebar.slider("최소 상승확률", 0.50, 0.90, 0.60, 0.01)
 min_expected_net = st.sidebar.slider("최소 비용차감 기대수익률", 0.0, 10.0, 1.2, 0.1, format="%.1f%%") / 100
 min_final_score = st.sidebar.slider("최소 종합점수", 0.30, 0.95, 0.62, 0.01)
 risk_strength = st.sidebar.slider("리스크 감점 강도", 0.0, 2.0, 0.9, 0.05)
 use_market_filter = st.sidebar.checkbox("시장 추세 필터 사용", value=True)
+
+if model_mode == "3모델 앙상블":
+    st.sidebar.info("세 모델을 모두 실행하므로 단일 모델보다 시간이 오래 걸립니다.")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"<h3 style='color:{C['text']}'>🎚️ 매수 점수 가중치</h3>", unsafe_allow_html=True)
@@ -1375,8 +1851,15 @@ max_risk_score = st.sidebar.slider("허용 리스크 점수", 0.20, 1.00, 0.70, 
 min_dollar_volume = st.sidebar.number_input("최소 유동성($ 거래대금)", min_value=0.0, value=0.0, step=100000.0)
 risk_cfg = RiskConfig(start_capital, risk_per_trade, max_position_pct, fixed_stop_pct, take_profit_pct, atr_stop_mult, trailing_stop_pct, max_hold_bars, max_risk_score, min_dollar_volume)
 
-if not SKLEARN_AVAILABLE:
-    st.sidebar.warning("scikit-learn 설치 필요: pip install scikit-learn")
+missing_packages = validate_model_dependencies(model_mode)
+if missing_packages:
+    message = (
+        "필수 패키지가 없습니다: " + ", ".join(missing_packages)
+        + "\nrequirements.txt를 설치한 뒤 다시 실행하세요."
+    )
+    st.sidebar.error(message)
+    st.error(message)
+    st.stop()
 
 # ==========================================================
 # 화면 렌더링
@@ -1396,6 +1879,7 @@ def render_prediction_card(latest, market):
         <span class="badge {badge_cls}">{grade}</span>
       </div>
       <div style="font-size:13px;line-height:1.8;color:#cbd5e1;">
+        사용 모델 <b style="color:#fff;">{latest.get('model', model_mode)}</b><br>
         예측일 <b style="color:#fff;">{latest['date']}</b><br>
         {forecast_horizon}봉 예상 수익률 <b style="color:#fff;">{latest['pred_return']*100:+.2f}%</b><br>
         비용차감 기대수익률 <b style="color:#fff;">{latest['expected_net']*100:+.2f}%</b><br>
@@ -1455,19 +1939,88 @@ def render_metrics(metrics, acc, acc_n):
     st.markdown(html, unsafe_allow_html=True)
 
 
-def analyze_symbol(symbol, interval, data_range):
+def analyze_symbol(symbol, interval, data_range, scanner_fast=False):
     df_raw, name = fetch_ohlcv(symbol, interval, data_range)
-    if df_raw is None or len(df_raw) < max(lookback_window, 200) + forecast_horizon + 80:
+    minimum_rows = max(lookback_window, 200) + forecast_horizon + 80
+    if df_raw is None or len(df_raw) < minimum_rows:
         return None, name, None, None, None, [], pd.DataFrame(), [], [], {}, 0.0, 0, None
+
     df = calculate_indicators(df_raw)
     market = get_market_regime(symbol, interval, data_range)
     market_ok = market["ok"] if use_market_filter else True
-    pred_df = walk_forward_predictions(df, lookback_window, forecast_horizon, train_window, model_mode, risk_strength, cost_cfg, market["score"], step=pred_step, weights=score_weights, ml_weight=ml_weight)
-    latest = latest_prediction(df, lookback_window, forecast_horizon, train_window, model_mode, risk_strength, cost_cfg, market["score"], market_ok, weights=score_weights, ml_weight=ml_weight)
-    trades, equity_df, buys, sells, active = run_backtest(df, pred_df, min_prob, min_expected_net, min_final_score, cost_cfg, risk_cfg, market["ok"], use_market_filter)
-    metrics = calc_metrics(trades, equity_df, risk_cfg.start_capital)
-    acc, acc_n = prediction_accuracy(pred_df)
-    return df, name, market, pred_df, latest, trades, equity_df, buys, sells, metrics, acc, acc_n, active
+
+    latest = latest_prediction(
+        df,
+        lookback_window,
+        forecast_horizon,
+        train_window,
+        model_mode,
+        risk_strength,
+        cost_cfg,
+        market["score"],
+        market_ok,
+        weights=score_weights,
+        ml_weight=ml_weight,
+        model_epochs=model_epochs,
+        batch_size=deep_batch_size,
+        learning_rate=deep_learning_rate,
+        arima_order=arima_order,
+    )
+
+    if scanner_fast:
+        pred_df = pd.DataFrame()
+        trades, buys, sells, active = [], [], [], None
+        equity_df = pd.DataFrame()
+        metrics = calc_metrics(trades, equity_df, risk_cfg.start_capital)
+        acc, acc_n = 0.0, 0
+    else:
+        pred_df = walk_forward_predictions(
+            df,
+            lookback_window,
+            forecast_horizon,
+            train_window,
+            model_mode,
+            risk_strength,
+            cost_cfg,
+            market["score"],
+            step=pred_step,
+            weights=score_weights,
+            ml_weight=ml_weight,
+            model_epochs=model_epochs,
+            batch_size=deep_batch_size,
+            learning_rate=deep_learning_rate,
+            retrain_every=retrain_every,
+            arima_order=arima_order,
+        )
+        trades, equity_df, buys, sells, active = run_backtest(
+            df,
+            pred_df,
+            min_prob,
+            min_expected_net,
+            min_final_score,
+            cost_cfg,
+            risk_cfg,
+            market["ok"],
+            use_market_filter,
+        )
+        metrics = calc_metrics(trades, equity_df, risk_cfg.start_capital)
+        acc, acc_n = prediction_accuracy(pred_df)
+
+    return (
+        df,
+        name,
+        market,
+        pred_df,
+        latest,
+        trades,
+        equity_df,
+        buys,
+        sells,
+        metrics,
+        acc,
+        acc_n,
+        active,
+    )
 
 
 def render_asset_tab(asset_type, is_coin, default_list, default_input):
@@ -1489,7 +2042,8 @@ def render_asset_tab(asset_type, is_coin, default_list, default_input):
         st.warning("종목을 입력해 주세요.")
         return
 
-    result = analyze_symbol(symbol, interval, data_range)
+    with st.spinner(f"{model_mode} 모델 학습 및 검증 중..."):
+        result = analyze_symbol(symbol, interval, data_range)
     df, name, market, pred_df, latest, trades, equity_df, buys, sells, metrics, acc, acc_n, active = result
     if df is None:
         st.error("데이터가 부족하거나 불러오지 못했습니다. 일봉처럼 더 긴 기간이 있는 차트를 선택해 주세요.")
@@ -1594,7 +2148,14 @@ def render_scanner():
     else:
         raw = st.text_area("티커를 쉼표로 입력", "AAPL,NVDA,TSLA,BTC-USD,ETH-USD")
         base_list = [x.strip().upper() for x in raw.split(",") if x.strip()]
-    max_scan = st.slider("최대 스캔 개수", 1, min(20, len(base_list)), min(8, len(base_list)))
+    scan_limit = 4 if model_mode == "3모델 앙상블" else 8
+    max_scan = st.slider(
+        "최대 스캔 개수",
+        1,
+        min(20, len(base_list)),
+        min(scan_limit, len(base_list)),
+    )
+    st.caption("스캐너는 속도를 위해 최신 신호만 계산하며 전체 Walk-forward 백테스트는 생략합니다.")
     time_label = st.selectbox("스캐너 차트 주기", list(TIMEFRAME_MAP.keys()), index=0, key="scanner_time")
     interval, data_range = TIMEFRAME_MAP[time_label]
     if st.button("스캔 실행", use_container_width=True):
@@ -1603,7 +2164,7 @@ def render_scanner():
         for k, sym in enumerate(base_list[:max_scan]):
             progress.progress((k + 1) / max_scan)
             try:
-                result = analyze_symbol(sym, interval, data_range)
+                result = analyze_symbol(sym, interval, data_range, scanner_fast=True)
                 df, name, market, pred_df, latest, trades, equity_df, buys, sells, metrics, acc, acc_n, active = result
                 if df is None or latest is None:
                     rows.append({"종목": sym, "이름": TICKER_NAME_MAP.get(sym, sym), "등급": "데이터부족"})
