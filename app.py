@@ -57,7 +57,7 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600;700;800;900&display=swap');
 :root{--ink:#18181b;--muted:#64748b;--line:rgba(148,163,184,.28);--green:#10b981;--red:#ef4444;--blue:#2563eb;--card:rgba(255,255,255,.88)}
-html,body,[class*="css"]{font-family:'Pretendard',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}.stApp{background:radial-gradient(circle at 12% 8%,rgba(37,99,235,.14),transparent 28%),radial-gradient(circle at 85% 0%,rgba(14,165,233,.14),transparent 30%),linear-gradient(180deg,#f8fbff 0%,#f4f7fb 45%,#eef3f8 100%);color:var(--ink)}.block-container{padding-top:1.05rem;padding-bottom:2.4rem;max-width:1540px}#MainMenu,footer,header{visibility:hidden}
+html,body,[class*="css"]{font-family:'Pretendard',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}.stApp{background:radial-gradient(circle at 12% 8%,rgba(37,99,235,.14),transparent 28%),radial-gradient(circle at 85% 0%,rgba(14,165,233,.14),transparent 30%),linear-gradient(180deg,#f8fbff 0%,#f4f7fb 45%,#eef3f8 100%);color:var(--ink)}.block-container{padding-top:1.05rem;padding-bottom:2.4rem;max-width:1540px}#MainMenu,footer{visibility:hidden}
 [data-testid="stSidebar"]{background:linear-gradient(180deg,#18181b 0%,#111827 52%,#0b1120 100%);border-right:1px solid rgba(255,255,255,.10);box-shadow:18px 0 44px rgba(15,23,42,.16)}[data-testid="stSidebar"] *{color:rgba(255,255,255,.92)!important}[data-testid="stSidebar"] label,[data-testid="stSidebar"] span,[data-testid="stSidebar"] p{color:rgba(255,255,255,.82)!important}[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:#fff!important;letter-spacing:-.02em}[data-testid="stSidebar"] hr{border-color:rgba(255,255,255,.10)}
 .stButton>button{border:0!important;border-radius:14px!important;font-weight:800!important;background:linear-gradient(135deg,#2563eb,#06b6d4)!important;color:#fff!important;box-shadow:0 14px 26px rgba(37,99,235,.23)!important;transition:all .18s ease-in-out!important}.stButton>button:hover{transform:translateY(-1px);box-shadow:0 18px 34px rgba(37,99,235,.32)!important;filter:brightness(1.03)}
 [data-baseweb="input"],[data-baseweb="select"]>div,textarea{border-radius:14px!important;border-color:rgba(148,163,184,.36)!important;background:rgba(255,255,255,.88)!important}[data-testid="stSidebar"] [data-baseweb="input"],[data-testid="stSidebar"] [data-baseweb="select"]>div,[data-testid="stSidebar"] textarea{background:rgba(255,255,255,.08)!important;border-color:rgba(255,255,255,.16)!important}
@@ -84,6 +84,18 @@ st.markdown("""
 .plan-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}.plan-item{background:rgba(248,250,252,.78);border:1px solid rgba(148,163,184,.20);border-radius:14px;padding:10px}.plan-label{font-size:11px;color:#64748b;font-weight:800}.plan-value{font-size:15px;color:#18181b;font-weight:900;margin-top:2px}
 [data-testid="stSidebar"]{background:linear-gradient(180deg,#07111f 0%,#0b1120 45%,#18181b 100%)}[data-testid="stSidebar"] .stSlider [data-testid="stTickBar"]{opacity:.35}
 @media(max-width:1100px){.kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.plan-grid{grid-template-columns:1fr}.hero-title{font-size:30px}}
+
+/* Streamlit 기본 사이드바 접기/펼치기 버튼을 항상 보이게 유지 */
+header[data-testid="stHeader"]{visibility:visible!important;background:transparent!important;box-shadow:none!important;z-index:999990!important}
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"]{visibility:visible!important;display:flex!important;opacity:1!important;position:fixed!important;top:.7rem!important;left:.7rem!important;z-index:999999!important}
+[data-testid="stSidebarCollapseButton"]{visibility:visible!important;display:flex!important;opacity:1!important;z-index:999999!important}
+[data-testid="stSidebarCollapsedControl"] button,
+[data-testid="collapsedControl"] button,
+[data-testid="stSidebarCollapseButton"] button{visibility:visible!important;display:flex!important;opacity:1!important;background:#111827!important;color:#fff!important;border:1px solid rgba(255,255,255,.16)!important;border-radius:10px!important}
+.scanner-title-row{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:0 0 8px 0}
+.scanner-title-row h3{margin:0;font-size:1.55rem;line-height:1.2;color:#18181b}
+.scanner-title-row span{font-size:.78rem;line-height:1.45;color:#64748b;font-weight:500}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1902,14 +1914,6 @@ def make_price_chart(df, pred_df=None, buys=None, sells=None, min_prob=0.6, min_
     return fig
 
 
-def make_equity_chart(equity_df):
-    fig = go.Figure()
-    if equity_df is not None and not equity_df.empty:
-        fig.add_trace(go.Scatter(x=equity_df["date"], y=equity_df["equity"], mode="lines", name="자산곡선"))
-    fig.update_layout(template="plotly_white", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0.70)", height=310, margin=dict(l=10, r=10, t=12, b=10), hovermode="x unified", font=dict(family="Pretendard, sans-serif", color=C["text"]))
-    return fig
-
-
 # ==========================================================
 # 차트 보조지표 및 차트
 # ==========================================================
@@ -2124,88 +2128,6 @@ def make_price_chart(df, pred_df=None, buys=None, sells=None, min_prob=0.6, min_
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, font=dict(size=11)),
         font=dict(family="Pretendard, sans-serif", color=tv["text"]),
         title=dict(text="", x=0.01, y=0.99, font=dict(size=13, color=tv["muted"])),
-    )
-    return fig
-
-
-def make_equity_chart(equity_df):
-    tv = _chart_theme_values()
-    fig = go.Figure()
-    if equity_df is not None and not equity_df.empty:
-        eq = equity_df.copy().reset_index(drop=True)
-        x = list(range(len(eq)))
-        equity = pd.to_numeric(eq["equity"], errors="coerce").ffill().bfill()
-        fig.add_trace(go.Scatter(
-            x=x,
-            y=equity,
-            mode="lines",
-            line=dict(color="#00c087", width=2.4),
-            name="자산곡선",
-            hovertemplate="자산 %{y:,.2f}<extra></extra>",
-        ))
-        roll_max = equity.cummax().replace(0, np.nan)
-        dd = (equity / roll_max - 1) * 100
-        fig.add_trace(go.Scatter(
-            x=x,
-            y=dd,
-            yaxis="y2",
-            line=dict(color="#f23645", width=1.2, dash="dot"),
-            name="낙폭 %",
-            hovertemplate="낙폭 %{y:.2f}%<extra></extra>",
-        ))
-        step = max(1, len(eq) // 6)
-        fig.update_xaxes(
-            tickmode="array",
-            tickvals=x[::step],
-            ticktext=eq["date"].astype(str).to_list()[::step],
-            fixedrange=False,
-            gridcolor=tv["grid"],
-        )
-
-        lo = float(equity.min())
-        hi = float(equity.max())
-        base = max(abs(float(equity.iloc[0])), 1.0)
-        if math.isclose(lo, hi, rel_tol=1e-9, abs_tol=1e-9):
-            pad = base * 0.01
-            y_range = [lo - pad, hi + pad]
-            fig.add_annotation(
-                text="거래가 없거나 자산 변동이 없어 시작자산이 유지되었습니다.",
-                x=0.5,
-                y=0.12,
-                xref="paper",
-                yref="paper",
-                showarrow=False,
-                font=dict(color=tv["muted"], size=12),
-                bgcolor="rgba(17,21,27,.82)",
-                bordercolor="#2b313c",
-                borderpad=7,
-            )
-        else:
-            pad = max((hi - lo) * 0.10, base * 0.002)
-            y_range = [lo - pad, hi + pad]
-    else:
-        y_range = None
-        fig.add_annotation(
-            text="백테스트 자산 데이터가 없습니다.",
-            x=0.5,
-            y=0.5,
-            showarrow=False,
-            font=dict(color=tv["muted"], size=13),
-        )
-
-    fig.update_layout(
-        template=tv["template"],
-        paper_bgcolor=tv["paper"],
-        plot_bgcolor=tv["plot"],
-        height=360,
-        margin=dict(l=10, r=16, t=34, b=12),
-        hovermode="x unified",
-        dragmode="zoom",
-        uirevision="equity-chart-v2",
-        font=dict(family="Pretendard, sans-serif", color=tv["text"]),
-        yaxis=dict(title="자산", gridcolor=tv["grid"], side="right", range=y_range, fixedrange=False),
-        yaxis2=dict(title="낙폭 %", overlaying="y", side="left", showgrid=False, fixedrange=False),
-        legend=dict(orientation="h", y=1.08, x=0),
     )
     return fig
 
@@ -2734,11 +2656,6 @@ def render_asset_tab(default_list, default_input):
                     f"현재 조건을 통과한 신호는 {selected_n}건이지만 완료된 거래가 없습니다. "
                     "최소 상승확률·기대수익률·종합점수 또는 시장 필터를 완화해 보세요."
                 )
-            st.markdown("### 자산곡선")
-            if equity_df is not None and not equity_df.empty:
-                st.plotly_chart(make_equity_chart(equity_df), use_container_width=True, config=plot_config, key="equity_stock")
-            else:
-                st.info("백테스트 결과가 없어 자산곡선을 표시할 수 없습니다.")
         else:
             st.markdown("### 빠른 예측 결과")
             if latest is None:
@@ -2828,7 +2745,11 @@ def render_asset_tab(default_list, default_input):
 
 
 def render_scanner():
-    st.markdown("### 주식 스캐너")
+    st.markdown(
+        '<div class="scanner-title-row"><h3>주식 스캐너</h3>'
+        '<span>여러 종목을 한 번에 분석해 매수 후보를 빠르게 찾는 기능입니다.</span></div>',
+        unsafe_allow_html=True,
+    )
     scan_type = st.radio("스캔 방식", ["기본 목록", "직접 입력"], horizontal=True)
     if scan_type == "기본 목록":
         base_list = STOCK_SCAN_LIST
@@ -2841,14 +2762,25 @@ def render_scanner():
 
     scan_limit = 4 if model_mode == "3모델 앙상블" else 8
     max_scan = st.slider("최대 스캔 개수", 1, min(20, len(base_list)), min(scan_limit, len(base_list)))
-    st.caption("스캐너는 각 종목의 최신 신호만 계산합니다.")
+    st.caption("각 종목의 최신 예측 신호를 비교해 점수가 높은 순서로 보여줍니다.")
     time_label = st.selectbox("스캐너 차트 주기", list(TIMEFRAME_MAP.keys()), index=0, key="scanner_time")
     interval, data_range = TIMEFRAME_MAP[time_label]
 
-    if st.button("스캔 실행", use_container_width=True):
+    scan_signature = (
+        tuple(base_list[:max_scan]),
+        time_label,
+        model_mode,
+        int(lookback_window),
+        int(forecast_horizon),
+        int(train_window),
+    )
+
+    run_scan = st.button("스캔 실행", use_container_width=True, key="run_stock_scanner")
+    if run_scan:
         rows = []
-        update_progress, _, _ = create_progress_display("스캔 준비")
+        update_progress, progress_bar, progress_text = create_progress_display("스캔 준비")
         selected = base_list[:max_scan]
+
         for k, sym in enumerate(selected):
             def symbol_progress(local_value, message, index=k, ticker=sym):
                 overall = (index + float(np.clip(local_value, 0.0, 1.0))) / max_scan
@@ -2865,33 +2797,52 @@ def render_scanner():
                 df, name, market, pred_df, latest, trades, equity_df, buys, sells, metrics, acc, acc_n, active = result
                 if df is None or latest is None:
                     rows.append({"종목": sym, "이름": TICKER_NAME_MAP.get(sym, sym), "등급": "데이터부족"})
-                    continue
+                else:
+                    rows.append({
+                        "종목": sym,
+                        "이름": name,
+                        "등급": latest["grade"],
+                        "사유": latest["reason"],
+                        "상승확률": latest["prob_up"] * 100,
+                        "종합점수": latest.get("final_score", 0) * 100,
+                        "기술점수": latest.get("tech_score", 0) * 100,
+                        "비용차감 기대수익": latest["expected_net"] * 100,
+                        "리스크": latest["risk_score"] * 100,
+                        "시장": market["text"],
+                    })
+            except Exception as exc:
                 rows.append({
                     "종목": sym,
-                    "이름": name,
-                    "등급": latest["grade"],
-                    "사유": latest["reason"],
-                    "상승확률": latest["prob_up"] * 100,
-                    "종합점수": latest.get("final_score", 0) * 100,
-                    "기술점수": latest.get("tech_score", 0) * 100,
-                    "비용차감 기대수익": latest["expected_net"] * 100,
-                    "리스크": latest["risk_score"] * 100,
-                    "시장": market["text"],
+                    "이름": TICKER_NAME_MAP.get(sym, sym),
+                    "등급": "오류",
+                    "사유": str(exc)[:100],
                 })
-            except Exception as exc:
-                rows.append({"종목": sym, "이름": TICKER_NAME_MAP.get(sym, sym), "등급": "오류", "사유": str(exc)[:100]})
+
             update_progress((k + 1) / max_scan, f"{sym} 완료 ({k + 1}/{max_scan})")
 
-        update_progress(1.0, f"주식 {max_scan}개 스캔 완료")
         out = pd.DataFrame(rows)
-        if not out.empty and "상승확률" in out:
+        if not out.empty and "상승확률" in out.columns:
             grade_order = {"S": 0, "A": 1, "B": 2, "관망": 3, "금지": 4, "데이터부족": 5, "오류": 6}
             out["grade_rank"] = out["등급"].map(grade_order).fillna(9)
-            out = out.sort_values(["grade_rank", "종합점수", "비용차감 기대수익", "상승확률"], ascending=[True, False, False, False]).drop(columns=["grade_rank"])
+            sort_columns = [c for c in ["grade_rank", "종합점수", "비용차감 기대수익", "상승확률"] if c in out.columns]
+            ascending_map = {"grade_rank": True, "종합점수": False, "비용차감 기대수익": False, "상승확률": False}
+            out = out.sort_values(sort_columns, ascending=[ascending_map[c] for c in sort_columns])
+            if "grade_rank" in out.columns:
+                out = out.drop(columns=["grade_rank"])
             for col in ["상승확률", "종합점수", "기술점수", "비용차감 기대수익", "리스크"]:
-                if col in out:
+                if col in out.columns:
                     out[col] = out[col].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
-        st.dataframe(out, use_container_width=True, hide_index=True)
+
+        st.session_state["stock_scanner_results"] = out
+        st.session_state["stock_scanner_signature"] = scan_signature
+        update_progress(1.0, f"주식 {max_scan}개 스캔 완료")
+
+    saved_results = st.session_state.get("stock_scanner_results")
+    saved_signature = st.session_state.get("stock_scanner_signature")
+    if isinstance(saved_results, pd.DataFrame):
+        if saved_signature != scan_signature:
+            st.caption("아래 결과는 이전 설정으로 실행한 스캔 결과입니다. 현재 설정을 반영하려면 스캔 실행을 누르세요.")
+        st.dataframe(saved_results, use_container_width=True, hide_index=True)
 
 
 page = st.radio(
