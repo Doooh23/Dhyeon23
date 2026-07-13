@@ -1985,6 +1985,28 @@ if missing_packages:
 # 화면 렌더링
 # ==========================================================
 
+def _pct_bar(label, value, color):
+    """0~1 범위의 점수를 HTML 진행 막대로 반환한다."""
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        score = 0.0
+    if not np.isfinite(score):
+        score = 0.0
+    score = float(np.clip(score, 0.0, 1.0))
+    pct = score * 100.0
+    return f"""
+    <div style="margin-top:10px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;font-size:12px;color:#cbd5e1;">
+        <span>{label}</span>
+        <b style="color:#fff;">{pct:.1f}%</b>
+      </div>
+      <div style="height:8px;background:rgba(148,163,184,.18);border-radius:999px;overflow:hidden;">
+        <div style="width:{pct:.1f}%;height:100%;background:{color};border-radius:999px;"></div>
+      </div>
+    </div>
+    """
+
 def render_prediction_card(latest, market):
     if latest is None:
         st.warning("모델 학습에 필요한 데이터가 부족합니다.")
