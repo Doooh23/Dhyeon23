@@ -261,10 +261,57 @@ div[role="radiogroup"] label{
 """, unsafe_allow_html=True)
 
 
+
+
+# ==========================================================
+# 금융앱형 다크 차트 UI 오버라이드
+# ==========================================================
+
+st.markdown("""
+<style>
+/* 페이지는 단순하게 유지하고 차트 패널만 금융앱처럼 진한 검정으로 표시 */
+.stPlotlyChart{
+  background:#07090d!important;
+  border:1px solid #252a34!important;
+  border-radius:12px!important;
+  padding:3px!important;
+  overflow:hidden!important;
+}
+.stPlotlyChart .js-plotly-plot,
+.stPlotlyChart .plot-container,
+.stPlotlyChart .svg-container{
+  background:#07090d!important;
+  touch-action:none!important;
+  overscroll-behavior:contain!important;
+}
+/* 모바일에서 Plotly 도구막대를 항상 누를 수 있도록 크기 확보 */
+.stPlotlyChart .modebar{
+  opacity:1!important;
+  background:rgba(17,21,27,.92)!important;
+  border:1px solid #2b313c!important;
+  border-radius:7px!important;
+  padding:2px 3px!important;
+}
+.stPlotlyChart .modebar-btn svg{fill:#c9d1d9!important}
+.chart-help{
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  color:#71717a;font-size:12px;margin:2px 0 8px 2px;
+}
+.chart-help b{color:#27272a}
+.backtest-note{
+  border:1px solid #d4d4d8;background:#fafafa;border-radius:9px;
+  padding:10px 12px;margin:10px 0;color:#3f3f46;font-size:13px;line-height:1.55;
+}
+@media(max-width:900px){
+  .stPlotlyChart .modebar{transform:scale(1.08);transform-origin:top right}
+}
+</style>
+""", unsafe_allow_html=True)
+
 C = {
     "bg": "#f4f4f3", "surface": "#ffffff", "border": "#d4d4d8", "text": "#18181b", "subtext": "#71717a",
-    "buy": "#18181b", "sell": "#71717a", "warn": "#52525b", "blue": "#27272a",
-    "ma5": "#18181b", "ma20": "#52525b", "ma60": "#a1a1aa", "ma120": "#d4d4d8",
+    "buy": "#00c087", "sell": "#f23645", "warn": "#f0b90b", "blue": "#3b82f6",
+    "ma5": "#f0b90b", "ma20": "#3b82f6", "ma60": "#a855f7", "ma120": "#e5e7eb",
 }
 
 DB_FILE = "users_db.json"
@@ -1354,15 +1401,166 @@ def calc_position_size(capital, entry_price, stop_price, risk_cfg):
     return qty, used_capital
 
 
-def run_backtest(df, pred_df, min_prob, min_expected_net, min_final_score, cost_cfg, risk_cfg, market_ok=True, use_market_filter=True):
-    if pred_df.empty:
-        return [], pd.DataFrame(columns=["date", "equity"]), [], [], None
+def _build_backtest_signal_plan(
+    pred_df,
+    min_prob,
+    min_expected_net,
+    min_final_score,
+    round_trip_cost,
+    auto_tune=True,
+):
+    """과거 정보만 사용해 엄격 신호와 상대평가 보정 신호를 만든다."""
+    if pred_df is None or pred_df.empty:
+        return set(), set(), {
+            "신호모드": "예측 없음",
+            "엄격신호수": 0,
+            "보정신호수": 0,
+            "선택신호수": 0,
+        }
+
+    p = pred_df.copy().sort_values("idx").reset_index(drop=True)
+    for col, default in [
+        ("prob_up", 0.5),
+        ("expected_net", 0.0),
+        ("final_score", 0.5),
+        ("risk_score", 0.5),
+    ]:
+        if col not in p.columns:
+            p[col] = default
+        p[col] = pd.to_numeric(p[col], errors="coerce").fillna(default)
+
+    strict_mask = (
+        (p["prob_up"] >= float(min_prob))
+        & (p["expected_net"] >= float(min_expected_net))
+        & (p["final_score"] >= float(min_final_score))
+    )
+    strict_indices = set(p.loc[strict_mask, "idx"].astype(int).tolist())
+    adaptive_indices = set()
+
+    # 엄격 기준이 충분하면 사용자가 설정한 조건을 그대로 사용한다.
+    if bool(auto_tune) and len(strict_indices) < 3:
+        history_window = 24
+        for pos, row in p.iterrows():
+            history = p.iloc[max(0, pos - history_window + 1): pos + 1]
+            if len(history) >= 6:
+                prob_floor = max(0.50, float(history["prob_up"].quantile(0.58)))
+                expected_floor = max(
+                    -max(float(round_trip_cost), 0.0025),
+                    float(history["expected_net"].quantile(0.58)),
+                )
+                score_floor = max(0.45, float(history["final_score"].quantile(0.58)))
+            else:
+                prob_floor = 0.50
+                expected_floor = -max(float(round_trip_cost), 0.0025)
+                score_floor = 0.45
+
+            votes = int(row["prob_up"] >= prob_floor)
+            votes += int(row["expected_net"] >= expected_floor)
+            votes += int(row["final_score"] >= score_floor)
+
+            # 예측이 완전히 약한 구간은 제외하되 상위권 신호는 검증할 수 있게 한다.
+            base_ok = (
+                float(row["prob_up"]) >= 0.48
+                and float(row["expected_net"]) >= -max(float(round_trip_cost) * 1.5, 0.004)
+                and float(row["final_score"]) >= 0.40
+                and float(row["risk_score"]) <= 0.90
+            )
+            if base_ok and votes >= 2:
+                adaptive_indices.add(int(row["idx"]))
+
+        # 모델 출력이 지나치게 보수적이어도 상대적으로 가장 강한 신호를 소수 검증한다.
+        if not adaptive_indices and len(p) > 0:
+            rank_score = (
+                0.45 * p["prob_up"].rank(pct=True)
+                + 0.35 * p["expected_net"].rank(pct=True)
+                + 0.20 * p["final_score"].rank(pct=True)
+            )
+            fallback_n = max(1, min(5, int(math.ceil(len(p) * 0.10))))
+            fallback = p.assign(_rank=rank_score).nlargest(fallback_n, "_rank")
+            adaptive_indices = set(fallback["idx"].astype(int).tolist())
+
+    selected = strict_indices if len(strict_indices) >= 3 or not auto_tune else (strict_indices | adaptive_indices)
+    mode = "엄격 기준" if selected == strict_indices else "상대평가 자동 보정"
+    return strict_indices, selected, {
+        "신호모드": mode,
+        "엄격신호수": len(strict_indices),
+        "보정신호수": len(adaptive_indices),
+        "선택신호수": len(selected),
+    }
+
+
+def run_backtest(
+    df,
+    pred_df,
+    min_prob,
+    min_expected_net,
+    min_final_score,
+    cost_cfg,
+    risk_cfg,
+    market_ok=True,
+    use_market_filter=True,
+    auto_tune=True,
+):
+    capital = float(risk_cfg.start_capital)
+    if pred_df is None or pred_df.empty:
+        eq_df = pd.DataFrame({"idx": df.index, "date": df["date"], "equity": capital})
+        eq_df.attrs["signal_diagnostics"] = {
+            "신호모드": "예측 없음", "엄격신호수": 0, "보정신호수": 0,
+            "선택신호수": 0, "진입횟수": 0,
+        }
+        return [], eq_df, [], [], None
+
+    round_trip_cost = (
+        cost_cfg.fee_pct * 2
+        + cost_cfg.slippage_pct * 2
+        + cost_cfg.sell_tax_pct
+    )
+    strict_indices, selected_indices, diagnostics = _build_backtest_signal_plan(
+        pred_df,
+        min_prob,
+        min_expected_net,
+        min_final_score,
+        round_trip_cost,
+        auto_tune=auto_tune,
+    )
 
     signal_map = {int(r["idx"]): r for _, r in pred_df.iterrows()}
-    capital = float(risk_cfg.start_capital)
     cash = capital
     position = None
     trades, buys, sells, equity_rows = [], [], [], []
+    rejected_market = rejected_risk = rejected_liquidity = 0
+
+    def close_position(position_data, i, date, exit_ref_price, reason, cash_value):
+        exit_price = float(exit_ref_price) * (1 - cost_cfg.slippage_pct)
+        gross_value = position_data["qty"] * exit_price
+        fee = gross_value * cost_cfg.fee_pct
+        tax = gross_value * cost_cfg.sell_tax_pct
+        net_value = gross_value - fee - tax
+        new_cash = cash_value + net_value
+        ret = (
+            (net_value - position_data["entry_total_cost"])
+            / position_data["entry_total_cost"] * 100
+            if position_data["entry_total_cost"] else 0
+        )
+        trades.append({
+            "entryDate": position_data["entry_date"],
+            "entryPrice": position_data["entry_price"],
+            "exitDate": date,
+            "exitPrice": exit_price,
+            "qty": position_data["qty"],
+            "ret": ret,
+            "win": ret > 0,
+            "exitReason": reason,
+            "prob_up": position_data["prob_up"],
+            "pred_return": position_data["pred_return"] * 100,
+            "expected_net": position_data["expected_net"] * 100,
+            "risk_score": position_data["risk_score"],
+            "final_score": position_data.get("final_score", 0.0),
+            "capital_after": new_cash,
+            "signal_mode": position_data.get("signal_mode", "엄격 기준"),
+        })
+        sells.append({"idx": i, "price": exit_price, "date": date, "reason": reason})
+        return new_cash
 
     for i in range(len(df)):
         close = float(df.loc[i, "close"])
@@ -1372,7 +1570,10 @@ def run_backtest(df, pred_df, min_prob, min_expected_net, min_final_score, cost_
 
         if position is not None:
             position["max_high"] = max(position["max_high"], high)
-            trail_stop = position["max_high"] * (1 - risk_cfg.trailing_stop_pct) if risk_cfg.trailing_stop_pct > 0 else 0
+            trail_stop = (
+                position["max_high"] * (1 - risk_cfg.trailing_stop_pct)
+                if risk_cfg.trailing_stop_pct > 0 else 0
+            )
             active_stop = max(position["stop_price"], trail_stop)
             target = position["target_price"]
             reason = None
@@ -1386,38 +1587,28 @@ def run_backtest(df, pred_df, min_prob, min_expected_net, min_final_score, cost_
                 exit_ref_price = target
             elif (i - position["entry_idx"]) >= risk_cfg.max_hold_bars:
                 reason = "시간청산"
-                exit_ref_price = close
 
             if reason:
-                exit_price = exit_ref_price * (1 - cost_cfg.slippage_pct)
-                gross_value = position["qty"] * exit_price
-                fee = gross_value * cost_cfg.fee_pct
-                tax = gross_value * cost_cfg.sell_tax_pct
-                net_value = gross_value - fee - tax
-                cash += net_value
-                ret = (net_value - position["entry_total_cost"]) / position["entry_total_cost"] * 100 if position["entry_total_cost"] else 0
-                trades.append({
-                    "entryDate": position["entry_date"], "entryPrice": position["entry_price"],
-                    "exitDate": date, "exitPrice": exit_price, "qty": position["qty"],
-                    "ret": ret, "win": ret > 0, "exitReason": reason,
-                    "prob_up": position["prob_up"], "pred_return": position["pred_return"] * 100,
-                    "expected_net": position["expected_net"] * 100, "risk_score": position["risk_score"], "final_score": position.get("final_score", 0.0),
-                    "capital_after": cash,
-                })
-                sells.append({"idx": i, "price": exit_price, "date": date, "reason": reason})
+                cash = close_position(position, i, date, exit_ref_price, reason, cash)
                 position = None
 
-        if position is None:
+        if position is None and i in selected_indices:
             row = signal_map.get(i)
             if row is not None:
-                market_pass = (market_ok or not use_market_filter)
-                risk_pass = float(row["risk_score"]) <= risk_cfg.max_risk_score
+                is_strict = i in strict_indices
+                # 자동 보정 신호는 시장 필터를 참고하되 완전 차단하지 않는다.
+                market_pass = (market_ok or not use_market_filter or not is_strict)
+                risk_limit = risk_cfg.max_risk_score if is_strict else max(risk_cfg.max_risk_score, 0.85)
+                risk_pass = float(row.get("risk_score", 0.5)) <= risk_limit
                 liquidity_pass = float(df.loc[i, "dollar_volume"]) >= risk_cfg.min_dollar_volume
-                signal_pass = (
-                    market_pass and risk_pass and liquidity_pass and
-                    float(row["prob_up"]) >= min_prob and float(row["expected_net"]) >= min_expected_net and float(row.get("final_score", 0.0)) >= min_final_score
-                )
-                if signal_pass and cash > 0:
+
+                if not market_pass:
+                    rejected_market += 1
+                elif not risk_pass:
+                    rejected_risk += 1
+                elif not liquidity_pass:
+                    rejected_liquidity += 1
+                elif cash > 0:
                     atr_pct = nan_to_zero(df.loc[i, "atr_pct"])
                     stop_pct = max(risk_cfg.fixed_stop_pct, risk_cfg.atr_stop_mult * atr_pct)
                     stop_pct = min(max(stop_pct, 0.005), 0.35)
@@ -1431,28 +1622,52 @@ def run_backtest(df, pred_df, min_prob, min_expected_net, min_final_score, cost_
                         if total_cost <= cash:
                             cash -= total_cost
                             position = {
-                                "entry_idx": i, "entry_date": date, "entry_price": entry_price,
-                                "qty": qty, "entry_total_cost": total_cost,
-                                "stop_price": stop_price, "target_price": target_price,
-                                "max_high": high, "prob_up": float(row["prob_up"]),
-                                "pred_return": float(row["pred_return"]), "expected_net": float(row["expected_net"]),
-                                "risk_score": float(row["risk_score"]),
+                                "entry_idx": i,
+                                "entry_date": date,
+                                "entry_price": entry_price,
+                                "qty": qty,
+                                "entry_total_cost": total_cost,
+                                "stop_price": stop_price,
+                                "target_price": target_price,
+                                "max_high": high,
+                                "prob_up": float(row["prob_up"]),
+                                "pred_return": float(row["pred_return"]),
+                                "expected_net": float(row["expected_net"]),
+                                "risk_score": float(row.get("risk_score", 0.5)),
                                 "final_score": float(row.get("final_score", 0.0)),
+                                "signal_mode": "엄격 기준" if is_strict else "상대평가 보정",
                             }
                             buys.append({"idx": i, "price": entry_price, "date": date})
 
-        # 일별 평가금액 기록
         if position is not None:
-            mark_value = position["qty"] * close * (1 - cost_cfg.slippage_pct) * (1 - cost_cfg.fee_pct - cost_cfg.sell_tax_pct)
+            mark_value = (
+                position["qty"] * close
+                * (1 - cost_cfg.slippage_pct)
+                * (1 - cost_cfg.fee_pct - cost_cfg.sell_tax_pct)
+            )
             equity = cash + mark_value
         else:
             equity = cash
         equity_rows.append({"idx": i, "date": date, "equity": equity})
 
-    active = position
-    eq_df = pd.DataFrame(equity_rows)
-    return trades, eq_df, buys, sells, active
+    # 마지막 봉까지 열린 포지션은 종료가로 청산해 거래 통계에서 누락되지 않게 한다.
+    if position is not None and len(df) > 0:
+        i = len(df) - 1
+        date = df.loc[i, "date"]
+        cash = close_position(position, i, date, float(df.loc[i, "close"]), "종료청산", cash)
+        position = None
+        equity_rows[-1]["equity"] = cash
 
+    eq_df = pd.DataFrame(equity_rows)
+    diagnostics.update({
+        "진입횟수": len(buys),
+        "완료거래수": len(trades),
+        "시장필터거절": rejected_market,
+        "리스크거절": rejected_risk,
+        "유동성거절": rejected_liquidity,
+    })
+    eq_df.attrs["signal_diagnostics"] = diagnostics
+    return trades, eq_df, buys, sells, position
 
 def max_drawdown(equity):
     if len(equity) == 0:
@@ -1747,14 +1962,14 @@ def calculate_indicators(df):
 
 def _chart_theme_values():
     return {
-        "template": "plotly_white",
-        "paper": "rgba(0,0,0,0)",
-        "plot": "#ffffff",
-        "grid": "rgba(161,161,170,.24)",
-        "text": "#18181b",
-        "muted": "#71717a",
-        "inc": "#18181b",
-        "dec": "#a1a1aa",
+        "template": "plotly_dark",
+        "paper": "#07090d",
+        "plot": "#07090d",
+        "grid": "rgba(148,163,184,.14)",
+        "text": "#d8dee9",
+        "muted": "#7d8590",
+        "inc": "#00c087",
+        "dec": "#f23645",
     }
 
 
@@ -1816,8 +2031,8 @@ def make_price_chart(df, pred_df=None, buys=None, sells=None, min_prob=0.6, min_
     )
 
     if globals().get("show_bollinger", True) and {"bb_upper", "bb_lower"}.issubset(dfp.columns):
-        fig.add_trace(go.Scatter(x=x, y=dfp["bb_upper"] * mult, line=dict(width=1, color="rgba(113,113,122,.45)"), name="상단 밴드", hoverinfo="skip"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=x, y=dfp["bb_lower"] * mult, fill="tonexty", fillcolor="rgba(113,113,122,.08)", line=dict(width=1, color="rgba(113,113,122,.45)"), name="하단 밴드", hoverinfo="skip"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=dfp["bb_upper"] * mult, line=dict(width=1, color="rgba(148,163,184,.38)"), name="상단 밴드", hoverinfo="skip"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=dfp["bb_lower"] * mult, fill="tonexty", fillcolor="rgba(59,130,246,.06)", line=dict(width=1, color="rgba(148,163,184,.38)"), name="하단 밴드", hoverinfo="skip"), row=1, col=1)
 
     ma_map = {"MA5": ("ma5", C["ma5"]), "MA20": ("ma20", C["ma20"]), "MA60": ("ma60", C["ma60"]), "MA120": ("ma120", C["ma120"]), "MA200": ("ma200", "#71717a")}
     for label in globals().get("ma_lines", ["MA5", "MA20", "MA60", "MA120"]):
@@ -1826,7 +2041,7 @@ def make_price_chart(df, pred_df=None, buys=None, sells=None, min_prob=0.6, min_
             fig.add_trace(go.Scatter(x=x, y=dfp[col] * mult, line=dict(color=color, width=1.45), name=label, hovertemplate=f"{label} %{{y:,.2f}}<extra></extra>"), row=1, col=1)
 
     if globals().get("show_vwap", True) and "vwap" in dfp.columns:
-        fig.add_trace(go.Scatter(x=x, y=dfp["vwap"] * mult, line=dict(color="#52525b", width=1.2, dash="dot"), name="VWAP"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=dfp["vwap"] * mult, line=dict(color="#f0b90b", width=1.2, dash="dot"), name="VWAP"), row=1, col=1)
 
     if globals().get("show_support_resistance", True):
         if "resistance60" in dfp.columns:
@@ -1860,15 +2075,15 @@ def make_price_chart(df, pred_df=None, buys=None, sells=None, min_prob=0.6, min_
     vol_colors = [tv["inc"] if dfp.loc[i, "close"] >= dfp.loc[i, "open"] else tv["dec"] for i in dfp.index]
     fig.add_trace(go.Bar(x=x, y=dfp["volume"], marker=dict(color=vol_colors), opacity=0.55, name="거래량"), row=2, col=1)
     if globals().get("show_volume_ma", True) and "volMa20" in dfp.columns:
-        fig.add_trace(go.Scatter(x=x, y=dfp["volMa20"], line=dict(color="#64748b", width=1.2), name="거래량 MA20"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=dfp["volMa20"], line=dict(color="#9ca3af", width=1.2), name="거래량 MA20"), row=2, col=1)
 
     row = 3
     for ind in aux:
         if row > rows:
             break
         if ind == "RSI" and "rsi" in dfp.columns:
-            fig.add_trace(go.Scatter(x=x, y=dfp["rsi"], line=dict(color="#52525b", width=1.4), name="RSI"), row=row, col=1)
-            fig.add_hrect(y0=70, y1=100, fillcolor="rgba(113,113,122,.08)", line_width=0, row=row, col=1)
+            fig.add_trace(go.Scatter(x=x, y=dfp["rsi"], line=dict(color="#f0b90b", width=1.4), name="RSI"), row=row, col=1)
+            fig.add_hrect(y0=70, y1=100, fillcolor="rgba(59,130,246,.06)", line_width=0, row=row, col=1)
             fig.add_hrect(y0=0, y1=30, fillcolor="rgba(161,161,170,.08)", line_width=0, row=row, col=1)
             for yv in [30, 50, 70]:
                 fig.add_hline(y=yv, row=row, col=1, line_width=.8, line_dash="dot", line_color=tv["grid"])
@@ -1876,25 +2091,25 @@ def make_price_chart(df, pred_df=None, buys=None, sells=None, min_prob=0.6, min_
         elif ind == "MACD" and {"macd", "macd_signal", "macd_hist"}.issubset(dfp.columns):
             hist_colors = [tv["inc"] if v >= 0 else tv["dec"] for v in dfp["macd_hist"].fillna(0)]
             fig.add_trace(go.Bar(x=x, y=dfp["macd_hist"], marker=dict(color=hist_colors), opacity=.45, name="MACD Hist"), row=row, col=1)
-            fig.add_trace(go.Scatter(x=x, y=dfp["macd"], line=dict(color="#27272a", width=1.3), name="MACD"), row=row, col=1)
-            fig.add_trace(go.Scatter(x=x, y=dfp["macd_signal"], line=dict(color="#71717a", width=1.1), name="Signal"), row=row, col=1)
+            fig.add_trace(go.Scatter(x=x, y=dfp["macd"], line=dict(color="#3b82f6", width=1.3), name="MACD"), row=row, col=1)
+            fig.add_trace(go.Scatter(x=x, y=dfp["macd_signal"], line=dict(color="#f0b90b", width=1.1), name="Signal"), row=row, col=1)
             fig.add_hline(y=0, row=row, col=1, line_width=.8, line_color=tv["grid"])
         elif ind == "Stochastic" and {"stoch_k", "stoch_d"}.issubset(dfp.columns):
-            fig.add_trace(go.Scatter(x=x, y=dfp["stoch_k"], line=dict(color="#3f3f46", width=1.2), name="%K"), row=row, col=1)
-            fig.add_trace(go.Scatter(x=x, y=dfp["stoch_d"], line=dict(color="#a1a1aa", width=1.2), name="%D"), row=row, col=1)
+            fig.add_trace(go.Scatter(x=x, y=dfp["stoch_k"], line=dict(color="#3b82f6", width=1.2), name="%K"), row=row, col=1)
+            fig.add_trace(go.Scatter(x=x, y=dfp["stoch_d"], line=dict(color="#f0b90b", width=1.2), name="%D"), row=row, col=1)
             fig.add_hline(y=80, row=row, col=1, line_width=.8, line_dash="dot", line_color=tv["grid"])
             fig.add_hline(y=20, row=row, col=1, line_width=.8, line_dash="dot", line_color=tv["grid"])
             fig.update_yaxes(range=[0, 100], row=row, col=1)
         elif ind == "ATR" and "atr_pct" in dfp.columns:
-            fig.add_trace(go.Scatter(x=x, y=dfp["atr_pct"] * 100, line=dict(color="#52525b", width=1.3), name="ATR %"), row=row, col=1)
+            fig.add_trace(go.Scatter(x=x, y=dfp["atr_pct"] * 100, line=dict(color="#f0b90b", width=1.3), name="ATR %"), row=row, col=1)
         row += 1
 
     step = max(1, len(dfp) // 8)
     tickvals = dfp.index.to_list()[::step]
     ticktext = dfp["date"].astype(str).to_list()[::step]
     for r in range(1, rows + 1):
-        fig.update_xaxes(tickmode="array", tickvals=tickvals, ticktext=ticktext, showgrid=True, gridcolor=tv["grid"], zeroline=False, showspikes=True, spikemode="across", spikesnap="cursor", spikecolor=tv["muted"], spikethickness=1, row=r, col=1)
-        fig.update_yaxes(showgrid=True, gridcolor=tv["grid"], zeroline=False, showspikes=True, spikecolor=tv["muted"], row=r, col=1)
+        fig.update_xaxes(tickmode="array", tickvals=tickvals, ticktext=ticktext, showgrid=True, gridcolor=tv["grid"], zeroline=False, showspikes=True, spikemode="across", spikesnap="cursor", spikecolor=tv["muted"], spikethickness=1, fixedrange=False, row=r, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor=tv["grid"], zeroline=False, showspikes=True, spikecolor=tv["muted"], fixedrange=False, side="right", row=r, col=1)
 
     fig.update_layout(
         template=tv["template"],
@@ -1904,8 +2119,8 @@ def make_price_chart(df, pred_df=None, buys=None, sells=None, min_prob=0.6, min_
         margin=dict(l=8, r=8, t=28, b=8),
         xaxis_rangeslider_visible=bool(globals().get("show_range_slider", False)),
         hovermode="x unified",
-        dragmode="pan",
-        uirevision="stock-price-chart",
+        dragmode="zoom",
+        uirevision="stock-price-chart-v2",
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, font=dict(size=11)),
         font=dict(family="Pretendard, sans-serif", color=tv["text"]),
         title=dict(text="", x=0.01, y=0.99, font=dict(size=13, color=tv["muted"])),
@@ -1917,15 +2132,81 @@ def make_equity_chart(equity_df):
     tv = _chart_theme_values()
     fig = go.Figure()
     if equity_df is not None and not equity_df.empty:
-        eq = equity_df.copy()
+        eq = equity_df.copy().reset_index(drop=True)
         x = list(range(len(eq)))
-        fig.add_trace(go.Scatter(x=x, y=eq["equity"], mode="lines", fill="tozeroy", fillcolor="rgba(39,39,42,.08)", line=dict(color="#27272a", width=2.2), name="자산곡선"))
-        roll_max = eq["equity"].cummax()
-        dd = (eq["equity"] / roll_max - 1) * 100
-        fig.add_trace(go.Scatter(x=x, y=dd, yaxis="y2", line=dict(color="#71717a", width=1.1, dash="dot"), name="낙폭 %"))
+        equity = pd.to_numeric(eq["equity"], errors="coerce").ffill().bfill()
+        fig.add_trace(go.Scatter(
+            x=x,
+            y=equity,
+            mode="lines",
+            line=dict(color="#00c087", width=2.4),
+            name="자산곡선",
+            hovertemplate="자산 %{y:,.2f}<extra></extra>",
+        ))
+        roll_max = equity.cummax().replace(0, np.nan)
+        dd = (equity / roll_max - 1) * 100
+        fig.add_trace(go.Scatter(
+            x=x,
+            y=dd,
+            yaxis="y2",
+            line=dict(color="#f23645", width=1.2, dash="dot"),
+            name="낙폭 %",
+            hovertemplate="낙폭 %{y:.2f}%<extra></extra>",
+        ))
         step = max(1, len(eq) // 6)
-        fig.update_xaxes(tickmode="array", tickvals=x[::step], ticktext=eq["date"].astype(str).to_list()[::step])
-    fig.update_layout(template=tv["template"], paper_bgcolor=tv["paper"], plot_bgcolor=tv["plot"], height=340, margin=dict(l=8, r=8, t=20, b=10), hovermode="x unified", dragmode="pan", uirevision="equity-chart", font=dict(family="Pretendard, sans-serif", color=tv["text"]), yaxis=dict(title="자산", gridcolor=tv["grid"]), yaxis2=dict(title="낙폭%", overlaying="y", side="right", showgrid=False), legend=dict(orientation="h", y=1.04, x=0))
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=x[::step],
+            ticktext=eq["date"].astype(str).to_list()[::step],
+            fixedrange=False,
+            gridcolor=tv["grid"],
+        )
+
+        lo = float(equity.min())
+        hi = float(equity.max())
+        base = max(abs(float(equity.iloc[0])), 1.0)
+        if math.isclose(lo, hi, rel_tol=1e-9, abs_tol=1e-9):
+            pad = base * 0.01
+            y_range = [lo - pad, hi + pad]
+            fig.add_annotation(
+                text="거래가 없거나 자산 변동이 없어 시작자산이 유지되었습니다.",
+                x=0.5,
+                y=0.12,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font=dict(color=tv["muted"], size=12),
+                bgcolor="rgba(17,21,27,.82)",
+                bordercolor="#2b313c",
+                borderpad=7,
+            )
+        else:
+            pad = max((hi - lo) * 0.10, base * 0.002)
+            y_range = [lo - pad, hi + pad]
+    else:
+        y_range = None
+        fig.add_annotation(
+            text="백테스트 자산 데이터가 없습니다.",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(color=tv["muted"], size=13),
+        )
+
+    fig.update_layout(
+        template=tv["template"],
+        paper_bgcolor=tv["paper"],
+        plot_bgcolor=tv["plot"],
+        height=360,
+        margin=dict(l=10, r=16, t=34, b=12),
+        hovermode="x unified",
+        dragmode="zoom",
+        uirevision="equity-chart-v2",
+        font=dict(family="Pretendard, sans-serif", color=tv["text"]),
+        yaxis=dict(title="자산", gridcolor=tv["grid"], side="right", range=y_range, fixedrange=False),
+        yaxis2=dict(title="낙폭 %", overlaying="y", side="left", showgrid=False, fixedrange=False),
+        legend=dict(orientation="h", y=1.08, x=0),
+    )
     return fig
 
 
@@ -2032,11 +2313,12 @@ retrain_every = st.sidebar.slider(
 )
 arima_order = (2, 0, 1)
 
-min_prob = st.sidebar.slider("최소 상승확률", 0.50, 0.90, 0.60, 0.01)
-min_expected_net = st.sidebar.slider("최소 비용차감 기대수익률", 0.0, 10.0, 1.2, 0.1, format="%.1f%%") / 100
-min_final_score = st.sidebar.slider("최소 종합점수", 0.30, 0.95, 0.62, 0.01)
+min_prob = st.sidebar.slider("최소 상승확률", 0.50, 0.90, 0.52, 0.01)
+min_expected_net = st.sidebar.slider("최소 비용차감 기대수익률", -1.0, 10.0, 0.0, 0.1, format="%.1f%%") / 100
+min_final_score = st.sidebar.slider("최소 종합점수", 0.30, 0.95, 0.50, 0.01)
+auto_signal_tuning = st.sidebar.checkbox("신호 부족 시 상대평가 자동 보정", value=True, help="엄격 기준 통과 신호가 3개 미만이면, 각 시점의 과거 예측 분포에서 상대적으로 강한 신호를 추가 검증합니다.")
 risk_strength = st.sidebar.slider("리스크 감점 강도", 0.0, 2.0, 0.9, 0.05)
-use_market_filter = st.sidebar.checkbox("시장 추세 필터 사용", value=True)
+use_market_filter = st.sidebar.checkbox("시장 추세 필터 사용", value=False)
 
 if model_mode == "3모델 앙상블":
     st.sidebar.info("세 모델을 모두 실행하므로 단일 모델보다 시간이 오래 걸립니다.")
@@ -2300,9 +2582,11 @@ def analyze_symbol(symbol, interval, data_range, scanner_fast=False, progress_ca
             risk_cfg,
             market["ok"],
             use_market_filter,
+            auto_tune=auto_signal_tuning,
         )
         _emit_progress(progress_callback, 0.96, "성과 지표 계산")
         metrics = calc_metrics(trades, equity_df, risk_cfg.start_capital)
+        metrics.update(equity_df.attrs.get("signal_diagnostics", {}))
         acc, acc_n = prediction_accuracy(pred_df)
 
     _emit_progress(progress_callback, 1.0, "분석 완료")
@@ -2349,6 +2633,9 @@ def render_asset_tab(default_list, default_input):
     current_signature = (
         symbol, interval, data_range, model_mode, lookback_window,
         forecast_horizon, train_window, model_epochs, pred_step, retrain_every,
+        min_prob, min_expected_net, min_final_score, auto_signal_tuning,
+        use_market_filter, risk_cfg.risk_per_trade, risk_cfg.max_position_pct,
+        risk_cfg.fixed_stop_pct, risk_cfg.take_profit_pct, risk_cfg.max_hold_bars,
     )
 
     run_col1, run_col2 = st.columns(2)
@@ -2415,12 +2702,14 @@ def render_asset_tab(default_list, default_input):
         "displaylogo": False,
         "displayModeBar": True,
         "doubleClick": "reset+autosize",
+        "doubleClickDelay": 500,
         "showTips": True,
+        "modeBarButtonsToRemove": ["lasso2d", "select2d"],
     }
 
     left, right = st.columns([7.5, 2.5])
     with left:
-        st.caption("차트 위에서 마우스 휠 또는 두 손가락 확대·축소를 사용할 수 있습니다. 더블클릭하면 초기 범위로 돌아갑니다.")
+        st.markdown('<div class="chart-help"><b>차트 조작</b><span>PC: 휠 확대·축소</span><span>모바일: 두 손가락 제스처</span><span>상단 + / − 버튼 사용 가능</span><span>더블탭: 초기화</span></div>', unsafe_allow_html=True)
         st.plotly_chart(
             make_price_chart(df, pred_df, buys, sells, min_prob, min_expected_net),
             use_container_width=True,
@@ -2429,6 +2718,22 @@ def render_asset_tab(default_list, default_input):
         )
         if run_mode == "full":
             render_metrics(metrics, acc, acc_n)
+            signal_mode = metrics.get("신호모드", "엄격 기준")
+            strict_n = int(metrics.get("엄격신호수", 0))
+            selected_n = int(metrics.get("선택신호수", strict_n))
+            completed_n = int(metrics.get("완료거래수", metrics.get("거래횟수", 0)))
+            if signal_mode == "상대평가 자동 보정":
+                st.markdown(
+                    f'<div class="backtest-note"><b>백테스트 신호 자동 보정 적용</b><br>'
+                    f'엄격 기준 통과 {strict_n}건 · 상대평가 후 선택 {selected_n}건 · 완료 거래 {completed_n}건<br>'
+                    f'자동 보정은 미래 데이터를 보지 않고 각 시점까지의 과거 예측 분포만 사용합니다.</div>',
+                    unsafe_allow_html=True,
+                )
+            elif completed_n == 0:
+                st.warning(
+                    f"현재 조건을 통과한 신호는 {selected_n}건이지만 완료된 거래가 없습니다. "
+                    "최소 상승확률·기대수익률·종합점수 또는 시장 필터를 완화해 보세요."
+                )
             st.markdown("### 자산곡선")
             if equity_df is not None and not equity_df.empty:
                 st.plotly_chart(make_equity_chart(equity_df), use_container_width=True, config=plot_config, key="equity_stock")
