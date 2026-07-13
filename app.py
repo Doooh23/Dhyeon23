@@ -2166,6 +2166,7 @@ def render_asset_tab(asset_type, is_coin, default_list, default_input):
     # 빠른 예측은 최신 신호만 계산하고, 정밀 백테스트는 사용자가 명시적으로 실행한다.
     result_key = f"analysis_result_{asset_type}"
     signature_key = f"analysis_signature_{asset_type}"
+    mode_key = f"analysis_run_mode_{asset_type}"
     current_signature = (symbol, interval, data_range, model_mode, lookback_window, forecast_horizon, train_window, model_epochs, pred_step, retrain_every)
 
     run_col1, run_col2 = st.columns(2)
@@ -2190,12 +2191,14 @@ def render_asset_tab(asset_type, is_coin, default_list, default_input):
             result = analyze_symbol(symbol, interval, data_range, scanner_fast=run_quick)
         st.session_state[result_key] = result
         st.session_state[signature_key] = current_signature
+        st.session_state[mode_key] = "quick" if run_quick else "full"
 
     if st.session_state.get(signature_key) != current_signature or result_key not in st.session_state:
         st.info("종목과 모델을 선택한 뒤 '빠른 예측 실행'을 누르세요. 정밀 백테스트는 필요할 때만 실행하는 것이 안정적입니다.")
         return
 
     result = st.session_state[result_key]
+    run_mode = st.session_state.get(mode_key, "full")
     df, name, market, pred_df, latest, trades, equity_df, buys, sells, metrics, acc, acc_n, active = result
     if df is None:
         st.error("데이터가 부족하거나 불러오지 못했습니다. 일봉처럼 더 긴 기간이 있는 차트를 선택해 주세요.")
@@ -2216,9 +2219,23 @@ def render_asset_tab(asset_type, is_coin, default_list, default_input):
     left, right = st.columns([7.5, 2.5])
     with left:
         st.plotly_chart(make_price_chart(df, pred_df, buys, sells, min_prob, min_expected_net), use_container_width=True, config={"scrollZoom": True}, key=f"chart_{asset_type}")
-        render_metrics(metrics, acc, acc_n)
-        st.markdown("### 자산곡선")
-        st.plotly_chart(make_equity_chart(equity_df), use_container_width=True, key=f"equity_{asset_type}")
+        if run_mode == "full":
+            render_metrics(metrics, acc, acc_n)
+            st.markdown("### 자산곡선")
+            if equity_df is not None and not equity_df.empty:
+                st.plotly_chart(make_equity_chart(equity_df), use_container_width=True, key=f"equity_{asset_type}")
+            else:
+                st.info("백테스트 결과가 없어 자산곡선을 표시할 수 없습니다.")
+        else:
+            st.markdown("### 빠른 예측 결과")
+            if latest is None:
+                st.warning("최신 예측값을 계산하지 못했습니다. 학습 표본 수나 차트 주기를 확인하세요.")
+            else:
+                q1, q2, q3 = st.columns(3)
+                q1.metric(f"{forecast_horizon}봉 예상 수익률", f"{latest['pred_return']*100:+.2f}%")
+                q2.metric("상승 확률", f"{latest['prob_up']*100:.1f}%")
+                q3.metric("비용 차감 기대수익", f"{latest['expected_net']*100:+.2f}%")
+                st.info("빠른 예측은 최신 시점 1건만 계산합니다. 총수익률, MDD, 승률, 거래 횟수와 자산곡선은 '정밀 백테스트 실행'에서만 계산됩니다.")
     with right:
         render_prediction_card(latest, market)
         render_trade_plan(df, latest)
@@ -2232,24 +2249,25 @@ def render_asset_tab(asset_type, is_coin, default_list, default_input):
         </span></div>
         """, unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown("### 백테스트 거래 기록")
-    if trades:
-        h = pd.DataFrame(trades)
-        h = h[["entryDate", "entryPrice", "exitDate", "exitPrice", "qty", "ret", "exitReason", "prob_up", "expected_net", "risk_score", "final_score", "capital_after", "win"]]
-        h.columns = ["매수일", "매수가", "매도일", "매도가", "수량", "수익률", "청산이유", "상승확률", "비용차감 기대수익", "리스크", "종합점수", "청산 후 자산", "성공"]
-        h["매수가"] = h["매수가"].apply(fmt_curr)
-        h["매도가"] = h["매도가"].apply(fmt_curr)
-        h["수익률"] = h["수익률"].map("{:+.2f}%".format)
-        h["상승확률"] = h["상승확률"].map(lambda x: f"{x*100:.1f}%")
-        h["비용차감 기대수익"] = h["비용차감 기대수익"].map(lambda x: f"{x*100:+.2f}%")
-        h["리스크"] = h["리스크"].map(lambda x: f"{x*100:.1f}%")
-        h["종합점수"] = h["종합점수"].map(lambda x: f"{x*100:.1f}%")
-        h["청산 후 자산"] = h["청산 후 자산"].apply(fmt_curr)
-        h["성공"] = h["성공"].map(lambda x: "✅" if x else "❌")
-        st.dataframe(h.iloc[::-1], use_container_width=True, hide_index=True)
-    else:
-        st.info("현재 조건으로는 거래 기록이 없습니다. 기준을 완화하거나 차트 주기를 바꿔보세요.")
+    if run_mode == "full":
+        st.markdown("---")
+        st.markdown("### 백테스트 거래 기록")
+        if trades:
+            h = pd.DataFrame(trades)
+            h = h[["entryDate", "entryPrice", "exitDate", "exitPrice", "qty", "ret", "exitReason", "prob_up", "expected_net", "risk_score", "final_score", "capital_after", "win"]]
+            h.columns = ["매수일", "매수가", "매도일", "매도가", "수량", "수익률", "청산이유", "상승확률", "비용차감 기대수익", "리스크", "종합점수", "청산 후 자산", "성공"]
+            h["매수가"] = h["매수가"].apply(fmt_curr)
+            h["매도가"] = h["매도가"].apply(fmt_curr)
+            h["수익률"] = h["수익률"].map("{:+.2f}%".format)
+            h["상승확률"] = h["상승확률"].map(lambda x: f"{x*100:.1f}%")
+            h["비용차감 기대수익"] = h["비용차감 기대수익"].map(lambda x: f"{x*100:+.2f}%")
+            h["리스크"] = h["리스크"].map(lambda x: f"{x*100:.1f}%")
+            h["종합점수"] = h["종합점수"].map(lambda x: f"{x*100:.1f}%")
+            h["청산 후 자산"] = h["청산 후 자산"].apply(fmt_curr)
+            h["성공"] = h["성공"].map(lambda x: "✅" if x else "❌")
+            st.dataframe(h.iloc[::-1], use_container_width=True, hide_index=True)
+        else:
+            st.info("정밀 백테스트가 완료됐지만 현재 조건을 통과한 거래가 없습니다. 매수 기준을 완화하거나 기간을 늘려보세요.")
 
     st.markdown("---")
     st.markdown(f"### 수동 {label} 모의투자")
